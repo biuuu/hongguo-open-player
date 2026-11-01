@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
-const { app, BrowserWindow, WebContentsView, ipcMain, Menu, shell, dialog } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, Menu, shell, dialog, screen } = require('electron');
 const path = require('path');
+const { MIN_WIDTH, MIN_HEIGHT, readBounds, fitBounds, writeBounds } = require('./miniWindowBounds');
 
 // 必须在 app.whenReady 之前注入 Chromium 硬件解码与 macOS VideoToolbox HEVC (H.265) 解码开关
 app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport,PlatformHEVCEncoderSupport');
@@ -14,6 +15,21 @@ let windowCreation = null;
 let playerView = null;
 let miniWindow = null;
 let quitting = false;
+let miniBounds;
+let miniBoundsTimer = null;
+
+function saveMiniBounds(window) {
+  if (!window || window.isDestroyed()) return;
+  miniBounds = window.getNormalBounds();
+  clearTimeout(miniBoundsTimer);
+  miniBoundsTimer = null;
+  writeBounds(app.getPath('userData'), miniBounds);
+}
+
+function scheduleMiniBoundsSave(window) {
+  clearTimeout(miniBoundsTimer);
+  miniBoundsTimer = setTimeout(() => saveMiniBounds(window), 400);
+}
 
 function resizePlayerView(window) {
   const [width, height] = window.getContentSize();
@@ -23,6 +39,7 @@ function resizePlayerView(window) {
 function restoreMainWindow() {
   if (!miniWindow || !mainWindow || mainWindow.isDestroyed()) return;
   const window = miniWindow;
+  saveMiniBounds(window);
   miniWindow = null;
   window.contentView.removeChildView(playerView);
   mainWindow.contentView.addChildView(playerView);
@@ -41,13 +58,19 @@ function setMiniMode(enabled) {
   if (miniWindow) return;
   if (mainWindow.isFullScreen()) throw new Error('请先退出全屏');
 
+  if (miniBounds === undefined) miniBounds = readBounds(app.getPath('userData'));
+  const bounds = miniBounds ? fitBounds(miniBounds, screen) : { width: 360, height: 640 };
   const window = new BrowserWindow({
-    width: 360, height: 640, minWidth: 240, minHeight: 160,
+    ...bounds, minWidth: MIN_WIDTH, minHeight: MIN_HEIGHT,
     frame: false, show: false, backgroundColor: '#000000',
     title: '红果开源播放器'
   });
   miniWindow = window;
-  window.on('resize', () => resizePlayerView(window));
+  window.on('resize', () => {
+    resizePlayerView(window);
+    scheduleMiniBoundsSave(window);
+  });
+  window.on('move', () => scheduleMiniBoundsSave(window));
   window.on('close', event => {
     if (quitting) return;
     event.preventDefault();
@@ -367,6 +390,7 @@ if (!gotTheLock) {
     event.preventDefault();
     try { require('../server/services/logger').info('Electron', '应用程序正在退出，保存状态并关闭服务...'); } catch (_) {}
     if (miniWindow && !miniWindow.isDestroyed()) {
+      saveMiniBounds(miniWindow);
       miniWindow.destroy();
       miniWindow = null;
     }

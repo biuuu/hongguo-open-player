@@ -176,6 +176,10 @@ createApp({
         }, 2500);
       }
     }
+    function refreshControlsForPlayback() {
+      if (isMiniMode.value && isControlsHidden.value) return;
+      resetControlsTimer();
+    }
     function holdControls(event) {
       if (!isMiniMode.value) return;
       volumeDragging = true;
@@ -993,7 +997,7 @@ createApp({
       if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing';
       isBuffering.value = false;
       reportClientLog('INFO', `播放器起播: 《${activeSeries.value?.series_title || ''}》 第 ${activeEpisodeIndex.value} 集`);
-      resetControlsTimer();
+      refreshControlsForPlayback();
     }
 
     function onCanPlay(event) {
@@ -1006,7 +1010,7 @@ createApp({
       isPlaying.value = false;
       if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused';
       saveProgressNow();
-      if (isMiniMode.value) resetControlsTimer();
+      if (isMiniMode.value) refreshControlsForPlayback();
       else {
         setControlsHidden(false);
         clearTimeout(controlsHideTimer);
@@ -1287,7 +1291,16 @@ createApp({
       document.addEventListener?.('fullscreenchange', fullscreenChanged);
       if (miniModeAvailable) removeMiniModeListener = window.desktopPlayer.onMiniModeRestored(miniModeRestored);
       if (navigator.mediaSession) {
-        const actions = { play: () => videoEl.value?.play(), pause: () => videoEl.value?.pause(), previoustrack: playPrevEpisode, nexttrack: playNextEpisode };
+        const mediaAction = action => () => {
+          if (isMiniMode.value && isControlsHidden.value) resetControlsTimer();
+          return action();
+        };
+        const actions = {
+          play: mediaAction(() => videoEl.value?.play()),
+          pause: mediaAction(() => videoEl.value?.pause()),
+          previoustrack: mediaAction(playPrevEpisode),
+          nexttrack: mediaAction(playNextEpisode)
+        };
         for (const [name, handler] of Object.entries(actions)) {
           try { navigator.mediaSession.setActionHandler(name, handler); } catch (_) {}
         }

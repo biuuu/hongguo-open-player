@@ -789,6 +789,59 @@ test('mini mode reports errors without changing the layout', async () => {
   assert.match(state.toastText.value, /窗口不可用/);
 });
 
+test('mini mode keeps hidden controls hidden through automatic episode transitions', () => {
+  let timer;
+  const actions = {};
+  const state = client(async () => response([]), {
+    setTimeout: (fn, ms) => { if (ms === 2500) timer = fn; return fn; },
+    clearTimeout: () => { timer = null; },
+    navigator: { userAgent: '', mediaSession: { setActionHandler: (name, handler) => { actions[name] = handler; } } }
+  });
+  state.mountForTest();
+  state.viewMode.value = 'theater';
+  state.isMiniMode.value = true;
+  state.activeEpisodes.value = [{ vid_index: 1 }, { vid_index: 2 }];
+  state.activeEpisodeIndex.value = 1;
+  const oldVideo = { ended: true, play: async () => {}, pause() {} };
+  state.videoEl.value = oldVideo;
+  state.isPlaying.value = true;
+  state.resetControlsTimer();
+  timer();
+
+  // The browser may dispatch pause before ended when the current episode finishes.
+  state.onPause({ target: oldVideo });
+  assert.equal(state.isControlsHidden.value, true);
+  state.onEnded({ target: oldVideo });
+  assert.equal(state.activeEpisodeIndex.value, 2);
+  assert.equal(state.isControlsHidden.value, true);
+  const newVideo = { play: async () => {}, pause() {} };
+  state.videoEl.value = newVideo;
+  state.onPause({ target: oldVideo });
+  state.onPlay({ target: newVideo });
+  assert.equal(state.isControlsHidden.value, true);
+  assert.equal(state.isPlaying.value, true);
+
+  state.handleWindowMouseMove();
+  assert.equal(state.isControlsHidden.value, false);
+  assert.ok(timer);
+  state.onPlay({ target: newVideo });
+  assert.equal(state.isControlsHidden.value, false);
+  timer();
+  actions.pause();
+  assert.equal(state.isControlsHidden.value, false);
+  state.onPause({ target: newVideo });
+  assert.ok(timer);
+
+  timer();
+  state.onEnded({ target: newVideo });
+  assert.equal(state.activeEpisodeIndex.value, 2);
+  assert.equal(state.isControlsHidden.value, true);
+  state.isMiniMode.value = false;
+  state.isFullscreen.value = true;
+  state.onPlay({ target: newVideo });
+  assert.equal(state.isControlsHidden.value, false);
+});
+
 test('theater sidebar toggle button toggles state and updates responsive button UI', () => {
   const state = client(async () => response([]));
   state.mountForTest();
@@ -1018,7 +1071,6 @@ test('onVideoError displays custom stream error when probe reports other server 
   await state.onVideoError();
   assert.match(state.videoErrorMessage.value, /HEVC 视频扩展/);
 });
-
 
 
 

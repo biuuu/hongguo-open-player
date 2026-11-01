@@ -1,20 +1,27 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
+const { readBounds, fitBounds, writeBounds } = require('../../src/electron/miniWindowBounds');
 
-for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and packaged window options on ${platform}`, async () => {
+for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and packaged window options on ${platform}`, async t => {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'player-window-'));
+  t.after(() => fs.rmSync(userData, { recursive: true, force: true }));
   const app = new EventEmitter();
   Object.assign(app, { commandLine: { appendSwitch() {} }, requestSingleInstanceLock: () => true,
-    whenReady: () => Promise.resolve(), getPath: () => '/tmp/player-user', setAboutPanelOptions() {}, quit() {} });
+    whenReady: () => Promise.resolve(), getPath: () => userData, setAboutPanelOptions() {}, quit() {} });
   const windows = [];
   const views = [];
   let miniHandler;
+  let saveTimer;
   class Window extends EventEmitter {
     static getAllWindows() { return windows.filter(w => !w.closed); }
     constructor(options) {
       super(); this.options = options; this.size = [options.width, options.height];
+      this.position = [options.x ?? 100, options.y ?? 100];
       this.contentView = {
         addChildView: view => { this.child = view; },
         removeChildView: view => { assert.equal(this.child, view); this.child = null; }
@@ -22,6 +29,7 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
       windows.push(this);
     }
     getContentSize() { return this.size; }
+    getNormalBounds() { return { x: this.position[0], y: this.position[1], width: this.size[0], height: this.size[1] }; }
     isDestroyed() { return !!this.closed; }
     isFullScreen() { return !!this.fullscreen; }
     destroy() { this.closed = true; this.emit('closed'); }
@@ -52,14 +60,19 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   let lastMenuTemplate = [];
   let openedUrl = null;
   const context = { console, process: { platform, env: {} }, __dirname: '/repo/src/electron',
+    setTimeout: fn => { saveTimer = fn; return fn; }, clearTimeout: () => { saveTimer = null; },
     require(name) {
       if (name === 'electron') return { app, BrowserWindow: Window, WebContentsView: View,
+        screen: { getDisplayMatching: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1080 } }) },
         ipcMain: { handle(name, handler) { assert.equal(name, 'set-mini-mode'); miniHandler = handler; } },
         Menu: { buildFromTemplate(tmpl) { lastMenuTemplate = tmpl; return tmpl; }, setApplicationMenu() {} },
         shell: { openExternal: async (url) => { openedUrl = url; }, openPath: async () => {} },
         dialog: { showErrorBox() {}, showMessageBox: async () => ({ response: 0 }) } };
       if (name === '../server/index.js') return { startServer: async () => { starts++; return { server: { close() {} }, port: 8899 }; } };
       if (name === '../server/services/logger') return require('../../src/server/services/logger');
+      if (name === '../server/services/streamService') return { shutdown() {} };
+      if (name === '../server/services/storeService') return { pending: Promise.resolve() };
+      if (name === './miniWindowBounds') return require('../../src/electron/miniWindowBounds');
       return require(name);
     } };
   vm.runInNewContext(fs.readFileSync(require.resolve('../../src/electron/main.js'), 'utf8'), context);
@@ -88,15 +101,26 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   assert.equal(mini.child, view);
   assert.equal(mini.shown, true);
   mini.size = [500, 300];
+  mini.position = [220, 180];
   mini.emit('resize');
+  mini.emit('move');
   assert.equal(view.bounds.width, 500);
   assert.equal(view.bounds.height, 300);
+  saveTimer();
+  assert.deepEqual(readBounds(userData), { x: 220, y: 180, width: 500, height: 300 });
+  mini.position = [240, 200];
+  mini.emit('move');
   miniHandler(sender, false);
   assert.equal(original.child, view);
   assert.equal(original.shown, true);
   assert.equal(view.closed, undefined);
   miniHandler(sender, true);
   const miniAgain = windows[2];
+  assert.deepEqual({ ...miniAgain.options }, {
+    x: 240, y: 200, width: 500, height: 300, minWidth: 240, minHeight: 160,
+    frame: false, show: false, backgroundColor: '#000000', title: '红果开源播放器'
+  });
+  miniAgain.position = [300, 240];
   let prevented = false;
   miniAgain.emit('close', { preventDefault() { prevented = true; } });
   assert.equal(prevented, true);
@@ -104,6 +128,8 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   assert.equal(original.child, view);
   miniHandler(sender, true);
   const miniReload = windows[3];
+  assert.equal(miniReload.options.x, 300);
+  miniReload.size = [600, 400];
   view.webContents.emit('did-start-navigation', {}, 'http://127.0.0.1:8899/', false, true);
   assert.equal(miniReload.closed, true);
   assert.equal(original.child, view);
@@ -136,6 +162,56 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   aboutHelp.click();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(openedUrl, 'https://github.com/zfdang/hongguo-open-player');
+
+  const newView = views[1];
+  const newSender = { sender: newView.webContents, senderFrame: newView.webContents.mainFrame };
+  miniHandler(newSender, true);
+  const miniOnQuit = windows[5];
+  assert.equal(miniOnQuit.options.width, 600);
+  miniOnQuit.size = [700, 500];
+  miniOnQuit.position = [400, 350];
+  let quitPrevented = false;
+  app.emit('before-quit', { preventDefault() { quitPrevented = true; } });
+  assert.equal(quitPrevented, true);
+  assert.deepEqual(readBounds(userData), { x: 400, y: 350, width: 700, height: 500 });
+
+  vm.runInNewContext(fs.readFileSync(require.resolve('../../src/electron/main.js'), 'utf8'), { ...context });
+  await new Promise(resolve => setImmediate(resolve));
+  const restartedView = views[2];
+  miniHandler({ sender: restartedView.webContents, senderFrame: restartedView.webContents.mainFrame }, true);
+  assert.equal(windows[7].options.x, 400);
+  assert.equal(windows[7].options.y, 350);
+  assert.equal(windows[7].options.width, 700);
+  assert.equal(windows[7].options.height, 500);
+});
+
+test('mini window bounds recover from missing or invalid data and fit the current display', t => {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'player-bounds-'));
+  t.after(() => fs.rmSync(userData, { recursive: true, force: true }));
+  assert.equal(readBounds(userData), null);
+  const bounds = { x: -1800, y: 100, width: 500, height: 600 };
+  writeBounds(userData, bounds);
+  assert.deepEqual(readBounds(userData), bounds);
+  const screen = { getDisplayMatching: () => ({ workArea: { x: 0, y: 20, width: 1000, height: 700 } }) };
+  assert.deepEqual(fitBounds(bounds, screen), { x: 0, y: 100, width: 500, height: 600 });
+  assert.deepEqual(fitBounds({ x: 900, y: 600, width: 1200, height: 900 }, screen),
+    { x: 0, y: 20, width: 1000, height: 700 });
+  const secondScreen = { getDisplayMatching: () => ({ workArea: { x: -1920, y: 0, width: 1920, height: 1080 } }) };
+  assert.deepEqual(fitBounds(bounds, secondScreen), bounds);
+  fs.writeFileSync(path.join(userData, 'mini-window-bounds.json'), '{"x":0,"y":0,"width":1,"height":600}');
+  const originalError = console.error;
+  const errors = [];
+  console.error = (...args) => errors.push(args);
+  try {
+    assert.equal(readBounds(userData), null);
+    fs.writeFileSync(path.join(userData, 'mini-window-bounds.json'), '{');
+    assert.equal(readBounds(userData), null);
+    writeBounds(path.join(userData, 'mini-window-bounds.json'), bounds);
+    assert.equal(errors.filter(([message]) => message === '读取小窗位置和尺寸失败:').length, 2);
+    assert.ok(errors.some(([message]) => message === '保存小窗位置和尺寸失败:'));
+  } finally {
+    console.error = originalError;
+  }
 });
 
 test('packaging artifact names use english hongguo-open-player without breaking chinese productName', () => {
