@@ -1344,9 +1344,6 @@ html.platform-mac .app-header {
 }
 
 /* 全屏空闲时自动淡出隐藏控制条与鼠标光标 */
-.player-container.controls-hidden,
-.player-container.controls-hidden *,
-.player-container.controls-hidden video,
 .player-container:fullscreen.controls-hidden,
 .player-container:fullscreen.controls-hidden *,
 .player-container.is-fullscreen.controls-hidden,
@@ -2598,3 +2595,94 @@ html.platform-win .app-header { padding-right: 160px; }
   .player-header { padding: 0 8px; gap: 5px; }
 }
 @media (prefers-reduced-motion: reduce) { .skeleton-cover, .skeleton-line { animation: none; } }
+
+/* 小窗保留同一个视频元素，浮层不占用画面空间。 */
+.mini-mode .app-header,
+.mini-mode .theater-sidebar,
+.mini-mode .player-header,
+.mini-mode .keyboard-hints,
+.mini-mode .episode-control,
+.mini-mode .fit-btn,
+.mini-mode .speed-selector,
+.mini-mode .fullscreen-btn {
+  display: none !important;
+}
+
+.mini-mode .theater-view {
+  top: 0;
+  height: 100vh;
+}
+
+.mini-mode .player-container {
+  display: block;
+  border: 0;
+  overflow: hidden;
+}
+
+.mini-mode .video-stage {
+  position: absolute;
+  inset: 0;
+  height: 100%;
+}
+
+.mini-mode .mini-header {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 44px;
+  z-index: 20;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 4px 8px;
+  background: linear-gradient(rgba(0, 0, 0, 0.75), transparent);
+  -webkit-app-region: drag;
+  transition: opacity 0.35s;
+}
+
+.mini-mode .mini-restore-btn {
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 4px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.45);
+  font-size: 20px;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.mini-mode .player-controls {
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 20;
+  height: auto;
+  padding: 8px 10px 10px;
+  border: 0;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.9));
+  transition: opacity 0.35s, transform 0.35s;
+}
+
+.mini-mode .controls-left,
+.mini-mode .controls-right {
+  gap: 2px;
+}
+
+.mini-mode .time-display {
+  white-space: nowrap;
+  margin-left: 2px;
+  font-size: 10px;
+}
+
+.mini-mode .volume-box {
+  gap: 0;
+}
+
+.mini-mode .volume-slider {
+  width: 36px;
+}
+
+.mini-mode .controls-hidden .mini-header,
+.mini-mode .controls-hidden .play-overlay-btn {
+  opacity: 0;
+  pointer-events: none;
+}

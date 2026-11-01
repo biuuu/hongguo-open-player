@@ -9,19 +9,52 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   Object.assign(app, { commandLine: { appendSwitch() {} }, requestSingleInstanceLock: () => true,
     whenReady: () => Promise.resolve(), getPath: () => '/tmp/player-user', setAboutPanelOptions() {}, quit() {} });
   const windows = [];
+  const views = [];
+  let miniHandler;
   class Window extends EventEmitter {
     static getAllWindows() { return windows.filter(w => !w.closed); }
-    constructor(options) { super(); this.options = options; this.webContents = new EventEmitter(); this.webContents.setWindowOpenHandler = handler => { this.open = handler; }; windows.push(this); }
-    async loadURL() { this.emit('ready-to-show'); }
+    constructor(options) {
+      super(); this.options = options; this.size = [options.width, options.height];
+      this.contentView = {
+        addChildView: view => { this.child = view; },
+        removeChildView: view => { assert.equal(this.child, view); this.child = null; }
+      };
+      windows.push(this);
+    }
+    getContentSize() { return this.size; }
+    isDestroyed() { return !!this.closed; }
+    isFullScreen() { return !!this.fullscreen; }
+    destroy() { this.closed = true; this.emit('closed'); }
+    hide() { this.shown = false; }
     show() { this.shown = true; }
-    focus() {}
+    focus() { this.focused = true; }
+  }
+  class View {
+    constructor(options) {
+      this.options = options;
+      this.webContents = new EventEmitter();
+      this.webContents.mainFrame = {};
+      this.webContents.setWindowOpenHandler = handler => { this.open = handler; };
+      this.webContents.loadURL = async () => { this.webContents.emit('did-finish-load'); };
+      this.webContents.isDestroyed = () => !!this.closed;
+      this.webContents.close = () => { this.closed = true; };
+      this.webContents.send = channel => { this.sent = channel; };
+      this.webContents.reload = () => { this.reloaded = true; };
+      this.webContents.reloadIgnoringCache = () => { this.forceReloaded = true; };
+      this.webContents.toggleDevTools = () => { this.devtools = true; };
+      this.webContents.getZoomLevel = () => this.zoom || 0;
+      this.webContents.setZoomLevel = level => { this.zoom = level; };
+      views.push(this);
+    }
+    setBounds(bounds) { this.bounds = bounds; }
   }
   let starts = 0;
   let lastMenuTemplate = [];
   let openedUrl = null;
   const context = { console, process: { platform, env: {} }, __dirname: '/repo/src/electron',
     require(name) {
-      if (name === 'electron') return { app, BrowserWindow: Window,
+      if (name === 'electron') return { app, BrowserWindow: Window, WebContentsView: View,
+        ipcMain: { handle(name, handler) { assert.equal(name, 'set-mini-mode'); miniHandler = handler; } },
         Menu: { buildFromTemplate(tmpl) { lastMenuTemplate = tmpl; return tmpl; }, setApplicationMenu() {} },
         shell: { openExternal: async (url) => { openedUrl = url; }, openPath: async () => {} },
         dialog: { showErrorBox() {}, showMessageBox: async () => ({ response: 0 }) } };
@@ -37,6 +70,51 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
     assert.equal(windows[0].options.titleBarOverlay.height, 40);
     assert.ok(require('../../package.json').build.files.includes('build/icon.ico'));
   }
+  const original = windows[0];
+  const view = views[0];
+  const sender = { sender: view.webContents, senderFrame: view.webContents.mainFrame };
+  assert.throws(() => miniHandler({ sender: {}, senderFrame: {} }, true), /无效/);
+  assert.throws(() => miniHandler({ ...sender, senderFrame: {} }, true), /无效/);
+  assert.throws(() => miniHandler(sender, 'true'), /无效/);
+  original.fullscreen = true;
+  assert.throws(() => miniHandler(sender, true), /全屏/);
+  original.fullscreen = false;
+  miniHandler(sender, true);
+  const mini = windows[1];
+  assert.equal(mini.options.frame, false);
+  assert.equal(mini.options.minWidth, 240);
+  assert.equal(mini.options.minHeight, 160);
+  assert.equal(original.shown, false);
+  assert.equal(mini.child, view);
+  assert.equal(mini.shown, true);
+  mini.size = [500, 300];
+  mini.emit('resize');
+  assert.equal(view.bounds.width, 500);
+  assert.equal(view.bounds.height, 300);
+  miniHandler(sender, false);
+  assert.equal(original.child, view);
+  assert.equal(original.shown, true);
+  assert.equal(view.closed, undefined);
+  miniHandler(sender, true);
+  const miniAgain = windows[2];
+  let prevented = false;
+  miniAgain.emit('close', { preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+  assert.equal(view.sent, 'mini-mode-restored');
+  assert.equal(original.child, view);
+  miniHandler(sender, true);
+  const miniReload = windows[3];
+  view.webContents.emit('did-start-navigation', {}, 'http://127.0.0.1:8899/', false, true);
+  assert.equal(miniReload.closed, true);
+  assert.equal(original.child, view);
+  const viewMenu = lastMenuTemplate.find(m => m.label === '视图');
+  for (const label of ['重新加载', '强制重新加载', '开发者工具', '放大']) {
+    viewMenu.submenu.find(item => item.label === label).click();
+  }
+  assert.equal(view.reloaded, true);
+  assert.equal(view.forceReloaded, true);
+  assert.equal(view.devtools, true);
+  assert.equal(view.zoom, 0.5);
   windows[0].closed = true;
   windows[0].emit('closed');
   app.emit('activate');
@@ -45,12 +123,12 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   assert.equal(starts, 1);
   for (const name of ['will-navigate', 'will-redirect']) {
     let blocked = 0;
-    for (const url of ['bad url', 'file:///etc/passwd', 'https://elsewhere.example']) windows[1].webContents.emit(name, { preventDefault() { blocked++; } }, url);
+    for (const url of ['bad url', 'file:///etc/passwd', 'https://elsewhere.example']) views[1].webContents.emit(name, { preventDefault() { blocked++; } }, url);
     assert.equal(blocked, 3);
   }
-  assert.equal(windows[1].shown, true);
-  assert.equal(windows.length, 2);
-  assert.equal(windows[1].open({ url: 'file:///etc/passwd' }).action, 'deny');
+  assert.equal(windows[4].shown, true);
+  assert.equal(windows.length, 5);
+  assert.equal(views[1].open({ url: 'file:///etc/passwd' }).action, 'deny');
   const helpMenu = lastMenuTemplate.find(m => m.label === '帮助');
   assert.ok(helpMenu);
   const aboutHelp = helpMenu.submenu.find(i => i.label === '关于 红果开源播放器');

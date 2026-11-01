@@ -729,6 +729,66 @@ test('fullscreen auto-hide: controls hide when idle while playing, awaken on int
   assert.equal(bodyClasses.has('hide-cursor'), false);
 });
 
+test('mini mode preserves player state, hides controls even when paused, and restores after native close', async () => {
+  let timer;
+  let nativeRestore;
+  const calls = [];
+  const state = client(async () => response([]), {
+    setTimeout: (fn, ms) => { if (ms === 2500) timer = fn; return 1; },
+    clearTimeout: () => { timer = null; },
+    window: {
+      addEventListener() {}, removeEventListener() {},
+      desktopPlayer: {
+        setMiniMode: async enabled => { calls.push(enabled); },
+        onMiniModeRestored: callback => { nativeRestore = callback; return () => {}; }
+      }
+    }
+  });
+  state.mountForTest();
+  state.viewMode.value = 'theater';
+  const video = { currentTime: 42, paused: true };
+  state.videoEl.value = video;
+  await state.toggleMiniMode();
+  assert.equal(state.isMiniMode.value, true);
+  assert.equal(state.videoEl.value, video);
+  assert.equal(video.currentTime, 42);
+  assert.ok(timer);
+  timer();
+  assert.equal(state.isControlsHidden.value, true);
+  state.handleWindowMouseMove();
+  assert.equal(state.isControlsHidden.value, false);
+  state.startScrubbing({ target: {} });
+  assert.equal(timer, null);
+  state.finishScrubbing();
+  assert.ok(timer);
+  state.holdControls({ target: {} });
+  assert.equal(timer, null);
+  state.releaseControls();
+  assert.ok(timer);
+  nativeRestore();
+  assert.equal(state.isMiniMode.value, false);
+  assert.equal(state.isControlsHidden.value, false);
+  assert.equal(timer, null);
+  await state.toggleMiniMode();
+  await state.toggleMiniMode();
+  assert.deepEqual(calls, [true, true, false]);
+});
+
+test('mini mode reports errors without changing the layout', async () => {
+  const state = client(async () => response([]), {
+    window: {
+      addEventListener() {}, removeEventListener() {},
+      desktopPlayer: {
+        setMiniMode: async () => { throw new Error('窗口不可用'); },
+        onMiniModeRestored: () => () => {}
+      }
+    }
+  });
+  await state.toggleMiniMode();
+  assert.equal(state.isMiniMode.value, false);
+  assert.match(state.toastText.value, /窗口不可用/);
+});
+
 test('theater sidebar toggle button toggles state and updates responsive button UI', () => {
   const state = client(async () => response([]));
   state.mountForTest();
@@ -958,8 +1018,6 @@ test('onVideoError displays custom stream error when probe reports other server 
   await state.onVideoError();
   assert.match(state.videoErrorMessage.value, /HEVC 视频扩展/);
 });
-
-
 
 
 
