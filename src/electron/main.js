@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-const { app, BrowserWindow, Menu, shell, dialog } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, Menu, shell, dialog } = require('electron');
 const path = require('path');
 
 // 必须在 app.whenReady 之前注入 Chromium 硬件解码与 macOS VideoToolbox HEVC (H.265) 解码开关
@@ -11,8 +11,65 @@ let mainWindow = null;
 let serverInstance = null;
 let serverStart = null;
 let windowCreation = null;
+let playerView = null;
+let miniWindow = null;
+let quitting = false;
+
+function resizePlayerView(window) {
+  const [width, height] = window.getContentSize();
+  playerView.setBounds({ x: 0, y: 0, width, height });
+}
+
+function restoreMainWindow() {
+  if (!miniWindow || !mainWindow || mainWindow.isDestroyed()) return;
+  const window = miniWindow;
+  miniWindow = null;
+  window.contentView.removeChildView(playerView);
+  mainWindow.contentView.addChildView(playerView);
+  resizePlayerView(mainWindow);
+  window.destroy();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function setMiniMode(enabled) {
+  if (!mainWindow || mainWindow.isDestroyed() || !playerView) throw new Error('播放窗口不可用');
+  if (!enabled) {
+    restoreMainWindow();
+    return;
+  }
+  if (miniWindow) return;
+  if (mainWindow.isFullScreen()) throw new Error('请先退出全屏');
+
+  const window = new BrowserWindow({
+    width: 360, height: 640, minWidth: 240, minHeight: 160,
+    frame: false, show: false, backgroundColor: '#000000',
+    title: '红果开源播放器'
+  });
+  miniWindow = window;
+  window.on('resize', () => resizePlayerView(window));
+  window.on('close', event => {
+    if (quitting) return;
+    event.preventDefault();
+    restoreMainWindow();
+    playerView.webContents.send('mini-mode-restored');
+  });
+  mainWindow.contentView.removeChildView(playerView);
+  window.contentView.addChildView(playerView);
+  resizePlayerView(window);
+  mainWindow.hide();
+  window.show();
+}
+
+ipcMain.handle('set-mini-mode', (event, enabled) => {
+  if (!playerView || event.sender !== playerView.webContents || event.senderFrame !== playerView.webContents.mainFrame || typeof enabled !== 'boolean') {
+    throw new Error('无效的小窗请求');
+  }
+  setMiniMode(enabled);
+});
+
 function createWindow() {
-  if (mainWindow) { mainWindow.focus(); return Promise.resolve(); }
+  if (mainWindow) { (miniWindow || mainWindow).focus(); return Promise.resolve(); }
   windowCreation ||= buildWindow().catch(error => {
     console.error('Window startup failed:', error);
     dialog.showErrorBox('播放器启动失败', '无法启动本地播放服务，请关闭应用后重试。');
@@ -48,12 +105,6 @@ async function buildWindow() {
     title: '红果开源播放器',
     backgroundColor: '#0f1015',
     autoHideMenuBar: !isMac, // Windows 下默认隐藏传统菜单栏，保持纯粹现代深色观影质感 (按 Alt 唤出)
-    webPreferences: {
-      nodeIntegration: false,
-      contextIsolation: true,
-      webSecurity: true,
-      devTools: true
-    },
     show: false // 待内容准备完毕后再优雅显示，避免白屏
   };
 
@@ -73,9 +124,25 @@ async function buildWindow() {
 
   const window = new BrowserWindow(windowOptions);
   mainWindow = window;
+  const view = new WebContentsView({
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      webSecurity: true,
+      devTools: true,
+      backgroundThrottling: false
+    }
+  });
+  playerView = view;
+  window.contentView.addChildView(view);
+  resizePlayerView(window);
+  window.on('resize', () => {
+    if (!miniWindow) resizePlayerView(window);
+  });
   const appUrl = `http://127.0.0.1:${port}`;
-  window.once('ready-to-show', () => window.show());
-  window.webContents.setWindowOpenHandler(({ url }) => {
+  view.webContents.once('did-finish-load', () => window.show());
+  view.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/.test(url)) shell.openExternal(url).catch(console.error);
     return { action: 'deny' };
   });
@@ -83,15 +150,20 @@ async function buildWindow() {
     try { if (new URL(url).origin === appUrl) return; } catch (_) {}
     event.preventDefault();
   };
-  window.webContents.on('will-navigate', guardNavigation);
-  window.webContents.on('will-redirect', guardNavigation);
+  view.webContents.on('will-navigate', guardNavigation);
+  view.webContents.on('will-redirect', guardNavigation);
+  view.webContents.on('did-start-navigation', (_event, _url, isSameDocument, isMainFrame) => {
+    if (miniWindow && isMainFrame && !isSameDocument) restoreMainWindow();
+  });
   window.on('closed', () => {
     if (mainWindow === window) mainWindow = null;
+    if (playerView === view) playerView = null;
+    if (!view.webContents.isDestroyed()) view.webContents.close();
   });
 
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
-      await window.loadURL(appUrl);
+      await view.webContents.loadURL(appUrl);
       break;
     } catch (err) {
       if (attempt === 5) throw err;
@@ -173,13 +245,17 @@ function setupMenu() {
     {
       label: '视图',
       submenu: [
-        { role: 'reload', label: '重新加载' },
-        { role: 'forceReload', label: '强制重新加载' },
-        { role: 'toggleDevTools', label: '开发者工具' },
+        { label: '重新加载', accelerator: 'CmdOrCtrl+R', click: () => playerView?.webContents.reload() },
+        { label: '强制重新加载', accelerator: 'CmdOrCtrl+Shift+R', click: () => playerView?.webContents.reloadIgnoringCache() },
+        { label: '开发者工具', accelerator: 'CmdOrCtrl+Shift+I', click: () => playerView?.webContents.toggleDevTools() },
         { type: 'separator' },
-        { role: 'resetZoom', label: '实际大小' },
-        { role: 'zoomIn', label: '放大' },
-        { role: 'zoomOut', label: '缩小' },
+        { label: '实际大小', accelerator: 'CmdOrCtrl+0', click: () => playerView?.webContents.setZoomLevel(0) },
+        { label: '放大', accelerator: 'CmdOrCtrl+Plus', click: () => {
+          if (playerView) playerView.webContents.setZoomLevel(playerView.webContents.getZoomLevel() + 0.5);
+        } },
+        { label: '缩小', accelerator: 'CmdOrCtrl+-', click: () => {
+          if (playerView) playerView.webContents.setZoomLevel(playerView.webContents.getZoomLevel() - 0.5);
+        } },
         { type: 'separator' },
         { role: 'togglefullscreen', label: '切换全屏' }
       ]
@@ -247,8 +323,9 @@ if (!gotTheLock) {
 } else {
   app.on('second-instance', () => {
     if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
+      const window = miniWindow || mainWindow;
+      if (window.isMinimized()) window.restore();
+      window.focus();
     }
   });
 
@@ -284,12 +361,15 @@ if (!gotTheLock) {
     }
   });
 
-  let quitting = false;
   app.on('before-quit', event => {
     if (quitting || !serverInstance) return;
     quitting = true;
     event.preventDefault();
     try { require('../server/services/logger').info('Electron', '应用程序正在退出，保存状态并关闭服务...'); } catch (_) {}
+    if (miniWindow && !miniWindow.isDestroyed()) {
+      miniWindow.destroy();
+      miniWindow = null;
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.destroy();
       mainWindow = null;

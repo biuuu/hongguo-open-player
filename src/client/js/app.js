@@ -70,8 +70,13 @@ createApp({
     const sidebarOpen = ref(true);
     const isScrubbing = ref(false);
     const isFullscreen = ref(false);
+    const isMiniMode = ref(false);
+    const miniModeAvailable = Boolean(window.desktopPlayer);
     const isControlsHidden = ref(false);
     let controlsHideTimer = null;
+    let miniModeChanging = false;
+    let volumeDragging = false;
+    let removeMiniModeListener;
     const previewTime = ref(0);
     const previewPercent = ref(0);
     const showPreview = ref(false);
@@ -149,7 +154,7 @@ createApp({
     }
 
     function handleWindowMouseMove() {
-      if (isFullscreen.value && isControlsHidden.value) {
+      if ((isFullscreen.value || isMiniMode.value) && isControlsHidden.value) {
         resetControlsTimer();
       }
     }
@@ -163,12 +168,51 @@ createApp({
         setControlsHidden(false);
       }
       clearTimeout(controlsHideTimer);
-      if (isFullscreen.value && isPlaying.value && !isScrubbing.value) {
+      if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging) {
         controlsHideTimer = setTimeout(() => {
-          if (isFullscreen.value && isPlaying.value && !isScrubbing.value) {
+          if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging) {
             setControlsHidden(true);
           }
         }, 2500);
+      }
+    }
+    function holdControls(event) {
+      if (!isMiniMode.value) return;
+      volumeDragging = true;
+      clearControlsTimer();
+      event.target.setPointerCapture?.(event.pointerId);
+    }
+    function releaseControls() {
+      volumeDragging = false;
+      resetControlsTimer();
+    }
+    function miniModeRestored() {
+      isMiniMode.value = false;
+      volumeDragging = false;
+      setControlsHidden(false);
+      clearControlsTimer();
+      nextTick(keepPlayerFocus);
+    }
+    async function toggleMiniMode() {
+      if (!miniModeAvailable || miniModeChanging) return;
+      miniModeChanging = true;
+      const enabled = !isMiniMode.value;
+      try {
+        if (enabled && document.fullscreenElement) await document.exitFullscreen();
+        await window.desktopPlayer.setMiniMode(enabled);
+        if (enabled) {
+          isMiniMode.value = true;
+          resetControlsTimer();
+        } else {
+          miniModeRestored();
+        }
+        await nextTick();
+        keepPlayerFocus();
+      } catch (err) {
+        console.error('切换小窗失败:', err);
+        notify('切换小窗失败：' + err.message);
+      } finally {
+        miniModeChanging = false;
       }
     }
     function previewSeek(event) {
@@ -215,6 +259,7 @@ createApp({
         fullscreenExitAt = Date.now();
         setControlsHidden(false);
         clearTimeout(controlsHideTimer);
+        if (isMiniMode.value) resetControlsTimer();
       } else {
         resetControlsTimer();
       }
@@ -904,7 +949,7 @@ createApp({
     }
 
     function toggleFullscreen() {
-      if (!videoEl.value) return;
+      if (!videoEl.value || isMiniMode.value) return;
       if (!document.fullscreenElement) {
         const target = videoEl.value.closest?.('.player-container') || videoEl.value;
         target.requestFullscreen().catch(err => {
@@ -961,8 +1006,11 @@ createApp({
       isPlaying.value = false;
       if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused';
       saveProgressNow();
-      setControlsHidden(false);
-      clearTimeout(controlsHideTimer);
+      if (isMiniMode.value) resetControlsTimer();
+      else {
+        setControlsHidden(false);
+        clearTimeout(controlsHideTimer);
+      }
     }
 
     function onLoadedMetadata(event) {
@@ -1189,6 +1237,7 @@ createApp({
           toggleFullscreen();
         } else if (e.code === 'Escape' || e.key === 'Escape') {
           if (document.fullscreenElement) { document.exitFullscreen().catch(console.error); return; }
+          if (isMiniMode.value) { e.preventDefault(); toggleMiniMode(); return; }
           if (Date.now() - fullscreenExitAt < 300) return;
           closeTheater();
         }
@@ -1236,6 +1285,7 @@ createApp({
       document.addEventListener?.('focusin', handleGlobalFocusIn);
       window.addEventListener('pagehide', saveProgressNow);
       document.addEventListener?.('fullscreenchange', fullscreenChanged);
+      if (miniModeAvailable) removeMiniModeListener = window.desktopPlayer.onMiniModeRestored(miniModeRestored);
       if (navigator.mediaSession) {
         const actions = { play: () => videoEl.value?.play(), pause: () => videoEl.value?.pause(), previoustrack: playPrevEpisode, nexttrack: playNextEpisode };
         for (const [name, handler] of Object.entries(actions)) {
@@ -1258,6 +1308,7 @@ createApp({
       document.removeEventListener?.('focusin', handleGlobalFocusIn);
       window.removeEventListener('pagehide', saveProgressNow);
       document.removeEventListener?.('fullscreenchange', fullscreenChanged);
+      removeMiniModeListener?.();
       clearTimeout(toastTimer); clearTimeout(osdTimer);
       setControlsHidden(false);
       clearTimeout(controlsHideTimer);
@@ -1269,7 +1320,7 @@ createApp({
 
     return {
       toastText, osdMessage, sidebarOpen, isScrubbing, previewTime, previewPercent, showPreview,
-      isFullscreen, isControlsHidden, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove,
+      isFullscreen, isMiniMode, miniModeAvailable, toggleMiniMode, isControlsHidden, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove, holdControls, releaseControls,
       previewSeek, seekFromSlider, startScrubbing, finishScrubbing,
       viewMode,
       currentTab,
