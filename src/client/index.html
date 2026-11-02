@@ -270,7 +270,7 @@
         <!-- 播放器主体 (竖屏 9:16) -->
         <div class="player-container" :class="{ 'is-fullscreen': isFullscreen, 'controls-hidden': isControlsHidden }" tabindex="-1" @pointermove="resetControlsTimer" @mousemove="resetControlsTimer" @click="resetControlsTimer">
           <div v-if="isMiniMode" class="mini-header">
-            <button class="mini-restore-btn" @click="toggleMiniMode" title="退出小窗 (Esc)" aria-label="退出小窗">⤢</button>
+            <button ref="miniRestoreBtnEl" class="mini-restore-btn" @pointerenter="handleControlsPointerEnter" @pointerleave="handleControlsPointerLeave" @click="toggleMiniMode" title="退出小窗 (Esc)" aria-label="退出小窗">⤢</button>
           </div>
           <div class="player-header">
             <button class="back-btn" @click="closeTheater">✕ 退出播放</button>
@@ -353,7 +353,7 @@
           </div>
 
           <!-- 播放器控制条 -->
-          <div class="player-controls" @pointerenter="!isMiniMode && clearControlsTimer()" @pointerleave="resetControlsTimer">
+          <div ref="playerControlsEl" class="player-controls" @pointerenter="handleControlsPointerEnter" @pointerleave="handleControlsPointerLeave">
             <!-- 进度条 -->
             <div class="progress-bar-container" :class="{ 'is-scrubbing': isScrubbing }" @pointermove="previewSeek" @pointerleave="showPreview = false">
               <span v-if="showPreview || isScrubbing" class="progress-time-tooltip" :style="{ left: previewPercent + '%' }">{{ formatTime(isScrubbing ? currentTime : previewTime) }}</span>
