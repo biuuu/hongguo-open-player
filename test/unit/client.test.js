@@ -734,7 +734,7 @@ test('mini mode preserves player state, hides controls even when paused, and res
   let nativeRestore;
   const calls = [];
   const state = client(async () => response([]), {
-    setTimeout: (fn, ms) => { if (ms === 2500) timer = fn; return 1; },
+    setTimeout: (fn, ms) => { if (ms === 1000) timer = fn; return 1; },
     clearTimeout: () => { timer = null; },
     window: {
       addEventListener() {}, removeEventListener() {},
@@ -774,6 +774,99 @@ test('mini mode preserves player state, hides controls even when paused, and res
   assert.deepEqual(calls, [true, true, false]);
 });
 
+test('mini controls stay visible over the toolbar and restore button, and hide one second after leaving', () => {
+  let now = 0;
+  let nextTimer = 0;
+  const timers = new Map();
+  const advance = ms => {
+    now += ms;
+    for (const [id, timer] of timers) {
+      if (timer.at <= now) {
+        timers.delete(id);
+        timer.fn();
+      }
+    }
+  };
+  const state = client(async () => response([]), {
+    setTimeout: (fn, ms) => {
+      const id = ++nextTimer;
+      timers.set(id, { fn, at: now + ms });
+      return id;
+    },
+    clearTimeout: id => timers.delete(id)
+  });
+  state.isMiniMode.value = true;
+  state.resetControlsTimer();
+  advance(999);
+  assert.equal(state.isControlsHidden.value, false);
+  state.handleWindowMouseMove();
+  advance(999);
+  assert.equal(state.isControlsHidden.value, false);
+  advance(1);
+  assert.equal(state.isControlsHidden.value, true);
+
+  for (const playing of [false, true]) {
+    state.isPlaying.value = playing;
+    state.handleWindowMouseMove();
+    assert.equal(state.isControlsHidden.value, false);
+    state.handleControlsPointerEnter();
+    state.handleWindowMouseMove();
+    state.resetControlsTimer();
+    advance(3000);
+    assert.equal(state.isControlsHidden.value, false);
+
+    state.startScrubbing({ target: {} });
+    state.finishScrubbing();
+    state.holdControls({ target: {} });
+    state.releaseControls();
+    advance(3000);
+    assert.equal(state.isControlsHidden.value, false);
+
+    state.handleControlsPointerLeave();
+    advance(999);
+    assert.equal(state.isControlsHidden.value, false);
+    advance(1);
+    assert.equal(state.isControlsHidden.value, true);
+  }
+});
+
+test('mini toolbar and restore button both handle pointer enter and leave', () => {
+  const html = fs.readFileSync(require.resolve('../../src/client/index.html'), 'utf8');
+  for (const className of ['player-controls', 'mini-restore-btn']) {
+    const tag = html.match(new RegExp(`<[^>]+class="${className}"[^>]*>`))?.[0];
+    assert.ok(tag, `${className} must exist`);
+    assert.match(tag, /@pointerenter="handleControlsPointerEnter"/);
+    assert.match(tag, /@pointerleave="handleControlsPointerLeave"/);
+  }
+});
+
+test('moving directly onto hidden mini controls holds them visible without a pointerenter event', () => {
+  let timer;
+  const state = client(async () => response([]), {
+    setTimeout: fn => { timer = fn; return fn; },
+    clearTimeout: () => { timer = null; }
+  });
+  state.isMiniMode.value = true;
+  state.playerControlsEl.value = {
+    offsetParent: { clientLeft: 0, clientTop: 0, getBoundingClientRect: () => ({ left: 10, top: 20 }) },
+    offsetLeft: 0, offsetTop: 500, offsetWidth: 360, offsetHeight: 80
+  };
+  state.miniRestoreBtnEl.value = { getBoundingClientRect: () => ({ left: 320, right: 352, top: 26, bottom: 58 }) };
+
+  for (const point of [{ clientX: 340, clientY: 560 }, { clientX: 336, clientY: 42 }]) {
+    state.setControlsHidden(true);
+    state.handleWindowMouseMove(point);
+    assert.equal(state.isControlsHidden.value, false);
+    assert.equal(timer, null);
+    state.handleControlsPointerLeave(point);
+    assert.equal(timer, null);
+    state.handleWindowMouseMove({ clientX: 180, clientY: 300 });
+    assert.ok(timer);
+    timer();
+    assert.equal(state.isControlsHidden.value, true);
+  }
+});
+
 test('mini mode reports errors without changing the layout', async () => {
   const state = client(async () => response([]), {
     window: {
@@ -793,7 +886,7 @@ test('mini mode keeps hidden controls hidden through automatic episode transitio
   let timer;
   const actions = {};
   const state = client(async () => response([]), {
-    setTimeout: (fn, ms) => { if (ms === 2500) timer = fn; return fn; },
+    setTimeout: (fn, ms) => { if (ms === 1000) timer = fn; return fn; },
     clearTimeout: () => { timer = null; },
     navigator: { userAgent: '', mediaSession: { setActionHandler: (name, handler) => { actions[name] = handler; } } }
   });
@@ -1071,6 +1164,3 @@ test('onVideoError displays custom stream error when probe reports other server 
   await state.onVideoError();
   assert.match(state.videoErrorMessage.value, /HEVC 视频扩展/);
 });
-
-
-

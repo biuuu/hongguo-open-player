@@ -73,9 +73,12 @@ createApp({
     const isMiniMode = ref(false);
     const miniModeAvailable = Boolean(window.desktopPlayer);
     const isControlsHidden = ref(false);
+    const playerControlsEl = ref(null);
+    const miniRestoreBtnEl = ref(null);
     let controlsHideTimer = null;
     let miniModeChanging = false;
     let volumeDragging = false;
+    let miniControlsHovered = false;
     let removeMiniModeListener;
     const previewTime = ref(0);
     const previewPercent = ref(0);
@@ -153,8 +156,27 @@ createApp({
       }
     }
 
-    function handleWindowMouseMove() {
-      if ((isFullscreen.value || isMiniMode.value) && isControlsHidden.value) {
+    function isPointerOverMiniControls(event) {
+      const controls = playerControlsEl.value;
+      const parent = controls?.offsetParent;
+      if (parent) {
+        // offset geometry remains in place while the hidden toolbar is translated offscreen.
+        const rect = parent.getBoundingClientRect();
+        const left = rect.left + parent.clientLeft + controls.offsetLeft;
+        const top = rect.top + parent.clientTop + controls.offsetTop;
+        if (event.clientX >= left && event.clientX < left + controls.offsetWidth &&
+            event.clientY >= top && event.clientY < top + controls.offsetHeight) return true;
+      }
+      const restore = miniRestoreBtnEl.value?.getBoundingClientRect();
+      return Boolean(restore && event.clientX >= restore.left && event.clientX < restore.right &&
+        event.clientY >= restore.top && event.clientY < restore.bottom);
+    }
+
+    function handleWindowMouseMove(event) {
+      if (isMiniMode.value) {
+        if (event) miniControlsHovered = isPointerOverMiniControls(event);
+        resetControlsTimer();
+      } else if (isFullscreen.value && isControlsHidden.value) {
         resetControlsTimer();
       }
     }
@@ -168,13 +190,24 @@ createApp({
         setControlsHidden(false);
       }
       clearTimeout(controlsHideTimer);
-      if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging) {
+      if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging && !(isMiniMode.value && miniControlsHovered)) {
         controlsHideTimer = setTimeout(() => {
-          if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging) {
+          if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging && !(isMiniMode.value && miniControlsHovered)) {
             setControlsHidden(true);
           }
-        }, 2500);
+        }, isMiniMode.value ? 1000 : 2500);
       }
+    }
+    function handleControlsPointerEnter() {
+      if (isMiniMode.value) {
+        miniControlsHovered = true;
+        setControlsHidden(false);
+      }
+      clearControlsTimer();
+    }
+    function handleControlsPointerLeave(event) {
+      miniControlsHovered = Boolean(isMiniMode.value && event && isPointerOverMiniControls(event));
+      resetControlsTimer();
     }
     function refreshControlsForPlayback() {
       if (isMiniMode.value && isControlsHidden.value) return;
@@ -193,6 +226,7 @@ createApp({
     function miniModeRestored() {
       isMiniMode.value = false;
       volumeDragging = false;
+      miniControlsHovered = false;
       setControlsHidden(false);
       clearControlsTimer();
       nextTick(keepPlayerFocus);
@@ -760,6 +794,7 @@ createApp({
       saveProgressNow();
       if (videoEl.value) videoEl.value.pause();
       resetPlayback();
+      miniControlsHovered = false;
       setControlsHidden(false);
       clearTimeout(controlsHideTimer);
       showDramaDetailModal.value = false;
@@ -1333,7 +1368,7 @@ createApp({
 
     return {
       toastText, osdMessage, sidebarOpen, isScrubbing, previewTime, previewPercent, showPreview,
-      isFullscreen, isMiniMode, miniModeAvailable, toggleMiniMode, isControlsHidden, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove, holdControls, releaseControls,
+      isFullscreen, isMiniMode, miniModeAvailable, toggleMiniMode, isControlsHidden, playerControlsEl, miniRestoreBtnEl, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove, handleControlsPointerEnter, handleControlsPointerLeave, holdControls, releaseControls,
       previewSeek, seekFromSlider, startScrubbing, finishScrubbing,
       viewMode,
       currentTab,
