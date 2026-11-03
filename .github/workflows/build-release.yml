@@ -56,20 +56,10 @@ jobs:
           node scripts/compute-release-version.js
 
   build:
-    name: Build Native Apps (${{ matrix.platform }})
+    name: Build Native Apps (windows)
     needs: prep
     if: ${{ needs.prep.outputs.should_release == 'true' }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            platform: macos
-            build_cmd: npm run build:mac
-          - os: windows-latest
-            platform: windows
-            build_cmd: npm run build:win
+    runs-on: windows-latest
 
     steps:
       - name: Checkout repository
@@ -92,19 +82,18 @@ jobs:
       - name: Run offline regression tests
         run: npm run test:unit
 
-      - name: Build platform packages
+      - name: Build Windows packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ${{ matrix.build_cmd }}
+        run: npm run build:win
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: artifacts-${{ matrix.platform }}
+          name: artifacts-windows
           path: |
-            dist-electron/*.dmg
-            dist-electron/*.exe
-            dist-electron/*.zip
+            dist-electron/*-win-x64*.exe
+            dist-electron/*-win-x64*.zip
           if-no-files-found: error
           retention-days: 1
 
@@ -117,12 +106,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Download all build artifacts
+      - name: Download Windows build artifacts
         uses: actions/download-artifact@v8
         with:
+          name: artifacts-windows
           path: release-assets
-          pattern: artifacts-*
-          merge-multiple: true
 
       - name: Compute SHA256 Checksums
         shell: bash
@@ -136,17 +124,17 @@ jobs:
         with:
           tag_name: ${{ needs.prep.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: "红果开源播放器 多平台原生桌面版 ${{ needs.prep.outputs.tag }}"
+          name: "红果开源播放器 Windows 原生桌面版 ${{ needs.prep.outputs.tag }}"
           draft: false
           prerelease: false
           generate_release_notes: true
           body: |
-            ### 🎬 红果开源播放器 多平台原生桌面版 ${{ needs.prep.outputs.tag }}
+            ### 🎬 红果开源播放器 Windows 原生桌面版 ${{ needs.prep.outputs.tag }}
 
-            专为 macOS 与 Windows 平台打造的原生多端桌面应用，开箱即用，无需打开任何网页浏览器。
+            Windows 原生桌面应用，开箱即用，无需打开任何网页浏览器。
 
             #### ✨ 核心特性：
-            - 🖥️ **macOS & Windows 原生双平台**：macOS (Apple Silicon & Intel) + Windows (x64) 全面覆盖；
+            - 🖥️ **Windows 原生桌面应用**：支持 Windows (x64)；
             - 🍿 **全集免费秒播**：免手机登录，突破网页试看限制，整部 80~100+ 集无缝畅播；
             - ⚡ **MP4 CENC 实时流式解密**：原生级内存实时解密与 8 路并发 Range 下载加速，极速起播；
             - 🎬 **沉浸式竖屏影院**：专为短剧定制的 9:16 沉浸比例，键盘 ↑/↓ 秒切集数，空格暂停，左右快进；
@@ -157,11 +145,5 @@ jobs:
               - 安装向导版：下载 `hongguo-open-player-*-win-x64-setup.exe`，双击根据向导安装，自动创建桌面与开始菜单快捷方式。
               - 单文件便携版：下载 `hongguo-open-player-*-win-x64-portable.exe`，双击直接运行。
               - 绿色免安装 ZIP：下载 `hongguo-open-player-*-win-x64.zip`，解压后双击 `红果开源播放器.exe` 直接运行。
-            - **macOS (Apple Silicon M1/M2/M3/M4)**：
-              - 安装镜像：下载 `hongguo-open-player-*-mac-arm64.dmg`，双击拖入 `Applications` 即可。
-              - 免安装 ZIP：下载 `hongguo-open-player-*-mac-arm64.zip`，解压后直接运行。
-            - **macOS (Intel x64)**：
-              - 安装镜像：下载 `hongguo-open-player-*-mac-x64.dmg`，双击拖入 `Applications` 即可。
-              - 免安装 ZIP：下载 `hongguo-open-player-*-mac-x64.zip`，解压后直接运行。
           files: |
             release-assets/*
