@@ -273,7 +273,7 @@
             <button ref="miniRestoreBtnEl" class="mini-restore-btn" @pointerenter="handleControlsPointerEnter" @pointerleave="handleControlsPointerLeave" @click="toggleMiniMode" title="退出小窗 (Esc)" aria-label="退出小窗">⤢</button>
           </div>
           <div class="player-header">
-            <button class="back-btn" @click="closeTheater">✕ 退出播放</button>
+            <button class="back-btn" @click="closeTheater"><svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12.5 4.5 7 10l5.5 5.5"/><path d="M7.5 10H17"/></svg><span>退出播放</span></button>
             <div class="now-playing-info">
               <h3 class="playing-title">{{ activeSeries?.series_title }}</h3>
               <span class="playing-ep-badge">第 {{ activeEpisodeIndex }} 集 / 全 {{ activeSeries?.total || activeEpisodes.length }} 集</span>
@@ -288,22 +288,15 @@
                 @click="sidebarOpen = !sidebarOpen" 
                 :aria-expanded="sidebarOpen" 
                 aria-controls="episode-sidebar" 
-                :title="sidebarOpen ? '收起右侧选集面板' : '展开右侧选集面板'"
+                :title="sidebarOpen ? '隐藏侧边栏' : '显示侧边栏'"
               >
-                <!-- 展开状态：右侧栏高亮 + 向右收起箭头 -->
-                <svg v-if="sidebarOpen" class="sidebar-toggle-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-                  <rect width="13" height="11" x="1.5" y="2.5" rx="1.5"/>
-                  <path d="M10 2.5v11"/>
-                  <path d="M10 2.5h3a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5h-3z" fill="currentColor" fill-opacity="0.25" stroke="none"/>
-                  <path d="m5.5 6.5 1.75 1.5-1.75 1.5"/>
+                <svg v-if="sidebarOpen" class="sidebar-toggle-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <rect x="2" y="3" width="16" height="14" rx="2"/><path d="M13 3v14"/><path d="M5 10h5M8 7.5 10.5 10 8 12.5"/>
                 </svg>
-                <!-- 收起状态：右侧栏虚线 + 向左拉出箭头 -->
-                <svg v-else class="sidebar-toggle-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-                  <rect width="13" height="11" x="1.5" y="2.5" rx="1.5"/>
-                  <path d="M10 2.5v11" stroke-dasharray="1.5 1.5"/>
-                  <path d="m7.25 6.5-1.75 1.5 1.75 1.5"/>
+                <svg v-else class="sidebar-toggle-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                  <rect x="2" y="3" width="16" height="14" rx="2"/><path d="M13 3v14" stroke-dasharray="2 2"/><path d="M10.5 10h-5M8 7.5 5.5 10 8 12.5"/>
                 </svg>
-                <span class="sidebar-toggle-label">{{ sidebarOpen ? '收起选集' : '展开选集' }}</span>
+                <span class="sidebar-toggle-label">{{ sidebarOpen ? '隐藏侧边栏' : '显示侧边栏' }}</span>
               </button>
             </div>
           </div>
@@ -333,6 +326,9 @@
               @click="handleVideoClick"
             ></video>
 
+            <div v-if="danmakuEnabled" class="danmaku-layer" :style="{ opacity: danmakuOpacity, height: (danmakuRows * 32) + 'px' }" aria-hidden="true">
+              <span v-for="item in visibleDanmaku" :key="item.index" class="danmaku-item" :style="{ top: (item.lane * 32) + 'px', left: ((1 - item.progress) * 100) + '%', transform: 'translateX(-' + (item.progress * 100) + '%)', color: item.color }">{{ item.text }}<sup v-if="item.likes > 0" class="danmaku-likes">+{{ item.likes }}</sup></span>
+            </div>
             <!-- 居中缓冲加载环 -->
             <div v-if="isBuffering" class="player-buffering">
               <div class="spinner"></div>
@@ -380,19 +376,25 @@
               </div>
 
               <div class="controls-right">
+                <div class="danmaku-control">
+                  <button class="danmaku-button" :class="{ active: danmakuEnabled }" @click="showDanmakuSettings = !showDanmakuSettings" :aria-expanded="showDanmakuSettings" title="弹幕设置">弹幕</button>
+                  <div v-if="showDanmakuSettings" class="danmaku-panel" @pointerenter="clearControlsTimer" @pointerleave="resetControlsTimer">
+                    <div class="danmaku-panel-header"><strong>弹幕设置</strong><button class="danmaku-switch" :class="{ active: danmakuEnabled }" @click="toggleDanmaku" :aria-pressed="danmakuEnabled">{{ danmakuEnabled ? '已开启' : '已关闭' }}</button></div>
+                    <div class="danmaku-panel-row"><span>显示行数</span><div class="danmaku-row-options"><button v-for="n in [1, 3, 5]" :key="n" :class="{ active: danmakuRows === n }" @click="danmakuRows = n">{{ n }} 行</button></div></div>
+                    <label class="danmaku-panel-row"><span>不透明度</span><input type="range" min="0.1" max="1" step="0.1" v-model.number="danmakuOpacity" aria-label="弹幕不透明度"><span>{{ Math.round(danmakuOpacity * 100) }}%</span></label>
+                    <div v-if="danmakuEnabled && danmakuStatus" class="danmaku-status">{{ danmakuStatus }} <button v-if="danmakuStatus.includes('失败')" @click="loadDanmaku(true)">重试</button></div>
+                  </div>
+                </div>
                 <!-- 画面比例模式 -->
                 <button class="ctrl-btn fit-btn" @click="toggleFitMode" :title="'画面比例 (当前: ' + (fitMode === 'contain' ? '完整自适应' : '铺满全屏') + ')'">
                   {{ fitMode === 'contain' ? '⤢ 适应' : '⛶ 铺满' }}
                 </button>
                 <!-- 倍速选择 -->
-                <div class="speed-selector">
-                  <select v-model="playbackRate" @change="changeSpeed">
-                    <option value="0.75">0.75x</option>
-                    <option value="1.0">1.0x</option>
-                    <option value="1.25">1.25x</option>
-                    <option value="1.5">1.5x</option>
-                    <option value="2.0">2.0x</option>
-                  </select>
+                <div class="speed-selector" @pointerenter="clearControlsTimer" @pointerleave="resetControlsTimer">
+                  <button class="speed-button" @click="showSpeedMenu = !showSpeedMenu" :aria-expanded="showSpeedMenu" aria-label="播放倍速">{{ playbackRate }}x <span aria-hidden="true">⌃</span></button>
+                  <div v-if="showSpeedMenu" class="speed-menu" aria-label="选择播放倍速">
+                    <button v-for="rate in ['0.75', '1.0', '1.25', '1.5', '2.0']" :key="rate" :class="{ active: playbackRate === rate }" :aria-pressed="playbackRate === rate" @click="selectSpeed(rate)">{{ rate }}x <span v-if="playbackRate === rate" aria-hidden="true">✓</span></button>
+                  </div>
                 </div>
                 <!-- 音量 -->
                 <div class="volume-box">
@@ -727,7 +729,7 @@
             <img class="about-brand-icon" src="/assets/app-icon.png" alt="" width="44" height="44" />
             <div class="about-brand-titles">
               <h3 class="about-title">红果开源播放器</h3>
-              <span class="about-version">v1.2.0 · 原生桌面客户端</span>
+              <span class="about-version">{{ appVersion ? 'v' + appVersion + ' · ' : '' }}原生桌面客户端</span>
             </div>
           </div>
           <button class="modal-close-btn" @click="closeAboutModal" title="关闭 (Esc)">✕</button>

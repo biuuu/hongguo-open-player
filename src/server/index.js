@@ -90,6 +90,20 @@ function sendApiError(res, error) {
   res.status(status).json({ error: status === 400 ? error.message : messages[error.code] || '操作失败，请稍后重试' });
 }
 
+// 版本来自打包时写入的 package.json，开发模式同样使用该文件。
+app.get('/api/system/version', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ version: require('../../package.json').version });
+});
+
+app.get('/api/danmaku/:seriesId/:vid', async (req, res) => {
+  const { seriesId, vid } = req.params;
+  if (!/^\d{6,30}$/.test(seriesId) || !/^\d{6,30}$/.test(vid)) return res.status(400).json({ error: '剧集编号无效' });
+  const result = await require('./native/danmaku').fetchDanmaku({ seriesId, vid, fresh: req.query.fresh === '1' });
+  res.set('Cache-Control', 'no-store');
+  res.json(result);
+});
+
 // ================= API 路由 =================
 
 /**

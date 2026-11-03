@@ -598,6 +598,9 @@ html.platform-mac .app-header {
 }
 
 .back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: transparent;
   border: 1px solid var(--border-color);
   color: var(--text-sub);
@@ -693,8 +696,8 @@ html.platform-mac .app-header {
 }
 
 .sidebar-toggle-icon {
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   flex-shrink: 0;
   display: block;
 }
@@ -923,6 +926,8 @@ html.platform-mac .app-header {
   gap: 12px;
 }
 
+.controls-right { gap: clamp(16px, 2vw, 28px); }
+
 .ctrl-btn {
   background: transparent;
   border: none;
@@ -937,6 +942,8 @@ html.platform-mac .app-header {
   border-radius: 4px;
   transition: all 0.15s;
 }
+
+.fit-btn { width: auto; padding: 0 4px; white-space: nowrap; }
 
 .ctrl-btn:hover:not(:disabled) {
   color: var(--accent);
@@ -2602,6 +2609,7 @@ html.platform-win .app-header { padding-right: 160px; }
 .mini-mode .player-header,
 .mini-mode .keyboard-hints,
 .mini-mode .episode-control,
+.mini-mode .danmaku-control,
 .mini-mode .fit-btn,
 .mini-mode .speed-selector,
 .mini-mode .fullscreen-btn {
@@ -2686,3 +2694,34 @@ html.platform-win .app-header { padding-right: 160px; }
   opacity: 0;
   pointer-events: none;
 }
+
+.danmaku-layer { position: absolute; inset: 60px 0 auto; height: 96px; overflow: hidden; pointer-events: none; z-index: 2; }
+.danmaku-item { position: absolute; white-space: nowrap; font-size: 20px; line-height: 30px; text-shadow: 1px 1px 3px #000, -1px -1px 3px #000; }
+.danmaku-setting { display: flex; align-items: center; gap: 3px; font-size: 12px; white-space: nowrap; }
+.danmaku-setting input { width: 60px; }
+
+.danmaku-control { position: relative; flex: none; }
+.danmaku-button { background: transparent; border: 1px solid var(--border-color); border-radius: 6px; padding: 5px 9px; color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+.danmaku-button.active { color: var(--accent); border-color: var(--accent); }
+.danmaku-panel { position: absolute; bottom: calc(100% + 14px); right: 0; width: 250px; padding: 16px; border: 1px solid var(--border-color); border-radius: 10px; background: #1b1d27; box-shadow: 0 8px 28px #0009; z-index: 20; color: var(--text-main); }
+.danmaku-panel-header, .danmaku-panel-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.danmaku-panel-header { margin-bottom: 16px; }
+.danmaku-panel-row { margin-top: 12px; font-size: 12px; white-space: nowrap; }
+.danmaku-switch, .danmaku-row-options button { border: 1px solid var(--border-color); border-radius: 5px; padding: 4px 8px; background: #282b36; color: var(--text-dim); cursor: pointer; }
+.danmaku-switch.active, .danmaku-row-options button.active { color: var(--accent); border-color: var(--accent); }
+.danmaku-row-options { display: flex; gap: 4px; }
+.danmaku-panel-row input { flex: 1; min-width: 0; accent-color: var(--accent); }
+.danmaku-status { margin-top: 12px; color: var(--text-dim); font-size: 12px; }
+.danmaku-status button { border: 0; background: none; color: var(--accent); cursor: pointer; }
+.danmaku-item { will-change: left, transform; }
+
+.danmaku-likes { font-size: 0.58em; line-height: 1; vertical-align: super; margin-left: 3px; font-weight: 600; }
+
+.speed-selector { position: relative; flex: none; }
+.speed-button { min-width: 70px; height: 32px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-card); color: var(--text-main); cursor: pointer; }
+.speed-button span { margin-left: 6px; color: var(--text-dim); }
+.speed-button:hover { border-color: var(--text-sub); }
+.speed-menu { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); width: 112px; padding: 5px; border: 1px solid var(--border-color); border-radius: 8px; background: #1b1d27; box-shadow: 0 8px 28px #0009; z-index: 20; }
+.speed-menu button { display: flex; width: 100%; justify-content: space-between; align-items: center; padding: 8px 10px; border: 0; border-radius: 5px; background: transparent; color: var(--text-main); cursor: pointer; font-size: 13px; }
+.speed-menu button:hover { background: #ffffff14; }
+.speed-menu button.active { color: var(--accent); background: #ff40551a; }

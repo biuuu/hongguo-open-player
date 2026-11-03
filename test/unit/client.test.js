@@ -748,8 +748,12 @@ test('mini mode preserves player state, hides controls even when paused, and res
   state.viewMode.value = 'theater';
   const video = { currentTime: 42, paused: true };
   state.videoEl.value = video;
+  state.showSpeedMenu.value = true;
+  state.showDanmakuSettings.value = true;
   await state.toggleMiniMode();
   assert.equal(state.isMiniMode.value, true);
+  assert.equal(state.showSpeedMenu.value, false);
+  assert.equal(state.showDanmakuSettings.value, false);
   assert.equal(state.videoEl.value, video);
   assert.equal(video.currentTime, 42);
   assert.ok(timer);
@@ -772,6 +776,32 @@ test('mini mode preserves player state, hides controls even when paused, and res
   await state.toggleMiniMode();
   await state.toggleMiniMode();
   assert.deepEqual(calls, [true, true, false]);
+});
+
+test('Escape exits mini mode after entering with player menus open', async () => {
+  const listeners = {};
+  const calls = [];
+  const state = client(async () => response([]), {
+    window: {
+      addEventListener: (name, fn) => { listeners[name] = fn; },
+      removeEventListener() {},
+      desktopPlayer: {
+        setMiniMode: async enabled => { calls.push(enabled); },
+        onMiniModeRestored: () => () => {}
+      }
+    }
+  });
+  state.mountForTest();
+  state.viewMode.value = 'theater';
+  state.showSpeedMenu.value = true;
+  state.showDanmakuSettings.value = true;
+  await state.toggleMiniMode();
+  let prevented = false;
+  listeners.keydown({ target: { tagName: 'DIV' }, code: 'Escape', key: 'Escape', preventDefault() { prevented = true; } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(prevented, true);
+  assert.equal(state.isMiniMode.value, false);
+  assert.deepEqual(calls, [true, false]);
 });
 
 test('mini controls stay visible over the toolbar and restore button, and hide one second after leaving', () => {
@@ -838,6 +868,13 @@ test('mini toolbar and restore button both handle pointer enter and leave', () =
     assert.match(tag, /@pointerenter="handleControlsPointerEnter"/);
     assert.match(tag, /@pointerleave="handleControlsPointerLeave"/);
   }
+});
+
+test('mini mode hides the danmaku settings control without hiding danmaku', () => {
+  const css = fs.readFileSync(require.resolve('../../src/client/css/app.css'), 'utf8');
+  const hiddenSelectors = css.match(/([^{}]+)\{\s*display:\s*none\s*!important;\s*\}/g) || [];
+  assert.ok(hiddenSelectors.some(rule => rule.includes('.mini-mode .danmaku-control')));
+  assert.ok(!hiddenSelectors.some(rule => rule.includes('.mini-mode .danmaku-layer')));
 });
 
 test('moving directly onto hidden mini controls holds them visible without a pointerenter event', () => {
@@ -960,7 +997,7 @@ test('index.html layout places favorite button to the left of sidebar-toggle-btn
   assert.ok(favIndex < toggleIndex, 'Favorite button must be on the left, sidebar toggle on the right');
   
   assert.ok(html.includes('sidebar-toggle-icon'));
-  assert.ok(html.includes("sidebarOpen ? '收起选集' : '展开选集'"));
+  assert.ok(html.includes("sidebarOpen ? '隐藏侧边栏' : '显示侧边栏'"));
 });
 
 test('drama detail modal state opens on openDramaDetail and closes on Escape/closeDramaDetail', () => {
@@ -1163,4 +1200,35 @@ test('onVideoError displays custom stream error when probe reports other server 
   state.videoEl.value = { error: { code: 3, message: 'Decode error' } };
   await state.onVideoError();
   assert.match(state.videoErrorMessage.value, /HEVC 视频扩展/);
+});
+
+test('enabled danmaku loads for each episode and retains display settings', async () => {
+  const calls = [];
+  const state = client(async url => {
+    calls.push(url);
+    if (url.startsWith('/api/danmaku/')) return response({ success: true, items: [], total: 0 });
+    return response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }, { vid: '222222', vid_index: 2 }] });
+  });
+  await state.openTheater({ series_id: '123456' });
+  assert.equal(state.danmakuEnabled.value, true);
+  assert.equal(state.danmakuRows.value, 3);
+  state.danmakuRows.value = 5;
+  state.danmakuOpacity.value = 0.4;
+  state.switchEpisode({ vid_index: 2 });
+  assert.ok(calls.some(url => url.startsWith('/api/danmaku/123456/111111')));
+  assert.ok(calls.some(url => url.startsWith('/api/danmaku/123456/222222')));
+  assert.equal(state.danmakuEnabled.value, true);
+  assert.equal(state.danmakuRows.value, 5);
+  assert.equal(state.danmakuOpacity.value, 0.4);
+});
+
+test('danmaku heat colors use fixed like thresholds', async () => {
+  const state = client(async url => url.startsWith('/api/danmaku/')
+    ? response({ success: true, items: [{ time: 0, text: 'a', likes: 10 }, { time: 0, text: 'b', likes: 100 }, { time: 0, text: 'c', likes: 500 }] })
+    : response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }] }));
+  await state.openTheater({ series_id: '123456' });
+  await new Promise(resolve => setImmediate(resolve));
+  const items = state.visibleDanmaku.value;
+  assert.equal(items.length, 3);
+  assert.equal(new Set(items.map(item => item.color)).size, 3);
 });
