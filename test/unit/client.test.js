@@ -7,7 +7,7 @@ function client(fetch, overrides = {}) {
   const mounted = [];
   vm.runInNewContext(fs.readFileSync(require.resolve('../../src/client/js/app.js'), 'utf8'), {
     Vue: { ref: value => ({ value }), computed: fn => ({ get value() { return fn(); } }),
-      nextTick: async fn => { if (fn) fn(); }, onMounted(fn) { mounted.push(fn); }, onUnmounted() {},
+      nextTick: async fn => { if (fn) fn(); }, watch() {}, onMounted(fn) { mounted.push(fn); }, onUnmounted() {},
       createApp: options => ({ mount() { state = options.setup(); } }) },
     navigator: { userAgent: '' }, document: { documentElement: { classList: { add() {} } } },
     fetch, console, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {}, window: { addEventListener() {}, removeEventListener() {} }, ...overrides
@@ -19,7 +19,7 @@ const response = data => ({ ok: true, json: async () => data });
 
 test('late catalog responses cannot replace the active tab; search pagination keeps keyword', async () => {
   const requests = [];
-  const state = client(url => new Promise(resolve => requests.push({ url, resolve })));
+  const state = client(url => url === '/api/search-history' ? Promise.resolve(response([])) : new Promise(resolve => requests.push({ url, resolve })));
   const first = state.loadCatalog();
   state.switchTab('favorites');
   requests[1].resolve(response([{ series_id: '2' }]));
@@ -1228,7 +1228,110 @@ test('danmaku heat colors use fixed like thresholds', async () => {
     : response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }] }));
   await state.openTheater({ series_id: '123456' });
   await new Promise(resolve => setImmediate(resolve));
-  const items = state.visibleDanmaku.value;
-  assert.equal(items.length, 3);
-  assert.equal(new Set(items.map(item => item.color)).size, 3);
+  assert.equal(new Set([10, 100, 500].map(likes => state.danmakuColor({ likes }))).size, 3);
+});
+
+test('danmaku engine receives episode comments and is replaced when switching episodes', async () => {
+  const instances = [];
+  class FakeDanmaku {
+    constructor(options) { this.options = options; instances.push(this); }
+    destroy() { this.destroyed = true; }
+    resize() {}
+  }
+  const state = client(async url => url.startsWith('/api/danmaku/')
+    ? response({ success: true, items: [{ time: 2, text: url.includes('111111') ? 'first' : 'second', likes: 0 }] })
+    : response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }, { vid: '222222', vid_index: 2 }] }),
+  { Danmaku: FakeDanmaku });
+  state.videoEl.value = { pause() {}, play() { return Promise.resolve(); } };
+  state.danmakuLayer.value = { offsetWidth: 800, offsetHeight: 96 };
+  await state.openTheater({ series_id: '123456' });
+  await new Promise(resolve => setImmediate(resolve));
+  const first = instances.at(-1);
+  assert.equal(first.options.comments[0].time, 2);
+  assert.equal(first.options.speed, 80);
+  state.switchEpisode({ vid_index: 2 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(first.destroyed, true);
+  assert.notEqual(instances.at(-1), first);
+  assert.equal(instances.at(-1).options.comments.length, 1);
+});
+
+test('search history selection searches again and supports removal', async () => {
+  const calls = [];
+  let stored = [];
+  const state = client(async (url, options) => {
+    calls.push(url);
+    if (url === '/api/search-history' && options?.method === 'POST') {
+      const { action, keyword } = JSON.parse(options.body);
+      stored = action === 'clear' ? [] : action === 'add' ? [keyword, ...stored.filter(x => x !== keyword)].slice(0, 10) : stored.filter(x => x !== keyword);
+      return response(stored);
+    }
+    return response({ results: [], hasMore: false });
+  });
+  state.searchKeyword.value = '  月亮  ';
+  await state.handleSearch();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.searchHistory.value[0], '月亮');
+  state.selectSearchHistory('月亮');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.filter(url => url.startsWith('/api/search?keyword=')).length, 2);
+  assert.equal(state.showSearchHistory.value, false);
+  state.updateSearchHistory('remove', '月亮');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.searchHistory.value.length, 0);
+  assert.equal(stored.length, 0);
+});
+
+test('late preference loading preserves changes made by the user', async () => {
+  let finishPreferences;
+  const updates = [];
+  const state = client((url, options) => {
+    if (url === '/api/preferences' && !options) return new Promise(resolve => { finishPreferences = resolve; });
+    if (url === '/api/preferences') { updates.push(JSON.parse(options.body)); return Promise.resolve(response({})); }
+    return Promise.resolve(response(url === '/api/search-history' ? [] : { results: [] }));
+  }, { document: { documentElement: { classList: { add() {} } }, addEventListener() {}, querySelector() { return null; } } });
+  state.mountForTest();
+  state.selectSpeed('2.0');
+  finishPreferences(response({ playbackRate: '0.75', volume: 0.5, danmakuRows: 5 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.playbackRate.value, '2.0');
+  assert.equal(state.volume.value, 0.5);
+  assert.equal(state.danmakuRows.value, 5);
+  assert.equal(updates[0].playbackRate, '2.0');
+});
+
+test('prefetch is requested near the end using remaining playback time', async () => {
+  const calls = [];
+  const state = client(async (url, options) => {
+    calls.push([url, options]);
+    if (url.startsWith('/api/series/')) return response({ series_id: '123', episodes: [{ vid: '111', vid_index: 1 }, { vid: '222', vid_index: 2 }] });
+    return response({ success: true, items: [] });
+  });
+  await state.openTheater({ series_id: '123' });
+  state.videoEl.value = { currentTime: 100, playbackRate: 2, buffered: { length: 0 } };
+  state.duration.value = 200;
+  state.isPlaying.value = true;
+  state.onTimeUpdate();
+  assert.equal(calls.filter(([url]) => url === '/api/prefetch/222').length, 0);
+  state.videoEl.value.currentTime = 112;
+  state.onTimeUpdate(); state.onTimeUpdate();
+  assert.equal(calls.filter(([url, options]) => url === '/api/prefetch/222' && options.method === 'POST').length, 1);
+});
+
+test('danmaku settings close on outside pointer interactions but remain open inside', () => {
+  const listeners = {};
+  const state = client(async () => response([]), {
+    document: { documentElement: { classList: { add() {} } }, addEventListener(name, fn) { listeners[name] = fn; }, removeEventListener() {} },
+    window: { addEventListener() {}, removeEventListener() {} }
+  });
+  state.mountForTest();
+  state.viewMode.value = 'theater';
+  state.showDanmakuSettings.value = true;
+  listeners.pointerdown({ target: { tagName: 'INPUT', type: 'range', closest: selector => selector === '.danmaku-control' ? {} : null } });
+  assert.equal(state.showDanmakuSettings.value, true);
+  listeners.pointerdown({ target: { tagName: 'INPUT', type: 'text', closest: () => null } });
+  assert.equal(state.showDanmakuSettings.value, false);
+  state.showDanmakuSettings.value = true;
+  listeners.pointerdown({ target: { tagName: 'BUTTON', closest: () => null } });
+  assert.equal(state.showDanmakuSettings.value, false);
 });

@@ -30,17 +30,28 @@
       </div>
 
       <div class="header-right">
-        <div class="search-box" :class="{ 'has-query': searchKeyword.trim() }">
+        <div class="search-box" :class="{ 'has-query': searchKeyword.trim() }" @focusout="onSearchFocusOut" @keydown.esc="showSearchHistory = false">
           <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true" focusable="false"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
           <input 
             type="text" 
             v-model="searchKeyword" 
-            @keydown.enter="handleSearch" 
+            @focus="showSearchHistory = true"
+            @click="showSearchHistory = true"
+            @keydown.enter="!$event.isComposing && handleSearch()"
+            :aria-expanded="showSearchHistory && searchHistory.length > 0"
+            aria-controls="search-history"
             placeholder="搜索短剧"
             aria-label="搜索短剧名、主角或题材"
           />
           <button v-if="searchKeyword" class="clear-btn" @click="searchKeyword = ''">✕</button>
           <button class="search-btn" @click="handleSearch">搜索</button>
+          <div v-if="showSearchHistory && searchHistory.length" id="search-history" class="search-history">
+            <div class="search-history-header"><span>最近搜索</span><button type="button" @click="updateSearchHistory('clear')">清空</button></div>
+            <div v-for="item in searchHistory" :key="item" class="search-history-row">
+              <button type="button" class="search-history-keyword" @click="selectSearchHistory(item)">{{ item }}</button>
+              <button type="button" class="search-history-remove" :aria-label="'删除搜索历史：' + item" @click="updateSearchHistory('remove', item)">×</button>
+            </div>
+          </div>
         </div>
 
         <!-- 菜单与帮助入口 (类似 Android 三横线菜单图标) -->
@@ -326,9 +337,7 @@
               @click="handleVideoClick"
             ></video>
 
-            <div v-if="danmakuEnabled" class="danmaku-layer" :style="{ opacity: danmakuOpacity, height: (danmakuRows * 32) + 'px' }" aria-hidden="true">
-              <span v-for="item in visibleDanmaku" :key="item.index" class="danmaku-item" :style="{ top: (item.lane * 32) + 'px', transform: 'translateX(calc(-' + (item.progress * 100) + 'cqw - ' + (item.progress * 100) + '%))', color: item.color }">{{ item.text }}<sup v-if="item.likes > 0" class="danmaku-likes">+{{ item.likes }}</sup></span>
-            </div>
+            <div v-if="danmakuEnabled" ref="danmakuLayer" class="danmaku-layer" :style="{ opacity: danmakuOpacity, height: (danmakuRows * 32) + 'px' }" aria-hidden="true"></div>
             <!-- 居中缓冲加载环 -->
             <div v-if="isBuffering" class="player-buffering">
               <div class="spinner"></div>
@@ -380,8 +389,8 @@
                   <button class="danmaku-button" :class="{ active: danmakuEnabled }" @click="showDanmakuSettings = !showDanmakuSettings" :aria-expanded="showDanmakuSettings" title="弹幕设置">弹幕</button>
                   <div v-if="showDanmakuSettings" class="danmaku-panel" @pointerenter="clearControlsTimer" @pointerleave="resetControlsTimer">
                     <div class="danmaku-panel-header"><strong>弹幕设置</strong><button class="danmaku-switch" :class="{ active: danmakuEnabled }" @click="toggleDanmaku" :aria-pressed="danmakuEnabled">{{ danmakuEnabled ? '已开启' : '已关闭' }}</button></div>
-                    <div class="danmaku-panel-row"><span>显示行数</span><div class="danmaku-row-options"><button v-for="n in [1, 3, 5]" :key="n" :class="{ active: danmakuRows === n }" @click="danmakuRows = n">{{ n }} 行</button></div></div>
-                    <label class="danmaku-panel-row"><span>不透明度</span><input type="range" min="0.1" max="1" step="0.1" v-model.number="danmakuOpacity" aria-label="弹幕不透明度"><span>{{ Math.round(danmakuOpacity * 100) }}%</span></label>
+                    <div class="danmaku-panel-row"><span>显示行数</span><div class="danmaku-row-options"><button v-for="n in [1, 3, 5]" :key="n" :class="{ active: danmakuRows === n }" @click="danmakuRows = n; savePreferences({ danmakuRows: n })">{{ n }} 行</button></div></div>
+                    <label class="danmaku-panel-row"><span>不透明度</span><input type="range" min="0.1" max="1" step="0.1" v-model.number="danmakuOpacity" @change="savePreferences({ danmakuOpacity })" aria-label="弹幕不透明度"><span>{{ Math.round(danmakuOpacity * 100) }}%</span></label>
                     <div v-if="danmakuEnabled && danmakuStatus" class="danmaku-status">{{ danmakuStatus }} <button v-if="danmakuStatus.includes('失败')" @click="loadDanmaku(true)">重试</button></div>
                   </div>
                 </div>
@@ -399,7 +408,7 @@
                 <!-- 音量 -->
                 <div class="volume-box">
                   <button class="ctrl-btn volume-btn" @click="toggleMute">{{ isMuted ? '🔇' : '🔊' }}</button>
-                  <input type="range" min="0" max="1" step="0.05" v-model="volume" @input="changeVolume" @pointerdown="holdControls" @pointerup="releaseControls" @pointercancel="releaseControls" @lostpointercapture="releaseControls" class="volume-slider" aria-label="音量"/>
+                  <input type="range" min="0" max="1" step="0.05" v-model="volume" @input="changeVolume" @change="savePreferences({ volume: Number(volume), isMuted })" @pointerdown="holdControls" @pointerup="releaseControls" @pointercancel="releaseControls" @lostpointercapture="releaseControls" class="volume-slider" aria-label="音量"/>
                 </div>
                 <button v-if="miniModeAvailable && !isMiniMode" class="ctrl-btn mini-entry-btn" @click="toggleMiniMode" title="小窗模式" aria-label="小窗模式">▣</button>
                 <!-- 全屏 -->
@@ -774,6 +783,7 @@
 
   <!-- 引入本地 Vue 3 -->
   <script src="/js/vue.global.prod.js"></script>
+  <script src="/js/danmaku.dom.js"></script>
   <script src="/js/app.js"></script>
 </body>
 </html>

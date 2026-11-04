@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-const { createApp, ref, computed, onMounted, onUnmounted, nextTick } = Vue;
+const { createApp, ref, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
 
 // 自动识别 macOS / Windows / Linux 宿主平台并注入 root class
 const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.userAgentData && navigator.userAgentData.platform === 'macOS');
@@ -12,6 +12,10 @@ createApp({
     const viewMode = ref('catalog'); // 'catalog' | 'theater'
     const currentTab = ref('hot-drama'); // 'hot-drama' | 'real-drama' | 'comic-drama' | 'ai-drama' | 'history' | 'favorites' | 'search'
     const searchKeyword = ref('');
+    const searchHistory = ref([]);
+    const showSearchHistory = ref(false);
+    let searchHistoryRevision = 0;
+    let searchHistoryQueue = Promise.resolve();
     const hotTags = ref(['离婚', '战神', '重生', '逆袭', '神医', '千金', '豪门', '甜宠']);
 
     // 目录与短剧列表
@@ -58,6 +62,7 @@ createApp({
     const showSpeedMenu = ref(false);
     function selectSpeed(rate) {
       playbackRate.value = rate;
+      savePreferences({ playbackRate: rate });
       showSpeedMenu.value = false;
       changeSpeed();
     }
@@ -67,6 +72,7 @@ createApp({
     let progressTimer = null;
     let pendingResumeSec = 0;
     let progressReady = false;
+    let lastNearEndPrefetch = 0;
     let theaterRequest = 0;
     let catalogScrollTop = 0;
     let fullscreenExitAt = 0;
@@ -93,21 +99,74 @@ createApp({
     const showAppMenu = ref(false);
     const danmakuEnabled = ref(true);
     const showDanmakuSettings = ref(false);
-    const danmakuClock = ref(0);
-    let danmakuFrame = null;
+    const danmakuLayer = ref(null);
+    let danmakuEngine = null;
+    let danmakuResizeObserver = null;
     function stopDanmakuAnimation() {
-      if (danmakuFrame !== null) cancelAnimationFrame(danmakuFrame);
-      danmakuFrame = null;
+      danmakuResizeObserver?.disconnect();
+      danmakuResizeObserver = null;
+      danmakuEngine?.destroy();
+      danmakuEngine = null;
     }
     function startDanmakuAnimation() {
-      if (danmakuFrame !== null || typeof requestAnimationFrame !== 'function') return;
-      const tick = () => {
-        danmakuFrame = null;
-        if (!danmakuEnabled.value || !isPlaying.value || !videoEl.value) return;
-        danmakuClock.value = videoEl.value.currentTime || 0;
-        danmakuFrame = requestAnimationFrame(tick);
+      if (danmakuEngine || !danmakuEnabled.value || !videoEl.value || !danmakuLayer.value || typeof Danmaku === 'undefined') return;
+      const layer = danmakuLayer.value;
+      const comments = danmakuItems.value.map(item => ({
+        time: item.time,
+        render() {
+          const text = document.createElement('span');
+          text.className = 'danmaku-item';
+          text.style.color = danmakuColor(item);
+          text.textContent = item.text;
+          if (item.likes > 0) {
+            const likes = document.createElement('sup');
+            likes.className = 'danmaku-likes';
+            likes.textContent = '+' + item.likes;
+            text.appendChild(likes);
+          }
+          return text;
+        }
+      }));
+      danmakuEngine = new Danmaku({ container: layer, media: videoEl.value, comments, speed: Math.max(1, layer.offsetWidth / 10) });
+      const resize = () => {
+        if (!danmakuEngine || !layer.offsetWidth || !layer.offsetHeight) return;
+        danmakuEngine.speed = layer.offsetWidth / 10;
+        danmakuEngine.resize();
       };
-      danmakuFrame = requestAnimationFrame(tick);
+      if (typeof ResizeObserver !== 'undefined') {
+        danmakuResizeObserver = new ResizeObserver(resize);
+        danmakuResizeObserver.observe(layer);
+      }
+    }
+    function refreshDanmakuEngine() {
+      stopDanmakuAnimation();
+      nextTick(startDanmakuAnimation);
+    }
+    const changedPreferences = new Set();
+    let preferencesQueue = Promise.resolve();
+    function savePreferences(values) {
+      Object.keys(values).forEach(key => changedPreferences.add(key));
+      preferencesQueue = preferencesQueue.then(async () => {
+        const response = await fetch('/api/preferences', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(values) });
+        if (!response.ok) throw new Error('保存失败');
+      }).catch(() => notify('播放器设置保存失败'));
+    }
+    async function loadPreferences() {
+      try {
+        const response = await fetch('/api/preferences');
+        if (!response.ok) throw new Error('读取失败');
+        const prefs = await response.json();
+        const refs = { danmakuEnabled, danmakuRows, danmakuOpacity, volume, isMuted, playbackRate, fitMode };
+        for (const [key, value] of Object.entries(prefs)) {
+          if (refs[key] && !changedPreferences.has(key)) refs[key].value = value;
+        }
+        if (!danmakuEnabled.value) stopDanmakuAnimation();
+        if (videoEl.value) {
+          videoEl.value.volume = Number(volume.value);
+          videoEl.value.muted = isMuted.value;
+          videoEl.value.playbackRate = Number(playbackRate.value);
+        }
+      } catch (_) { /* Keep defaults when stored preferences cannot be read. */ }
     }
     const danmakuRows = ref(3);
     const danmakuOpacity = ref(0.8);
@@ -123,6 +182,7 @@ createApp({
       danmakuKey = key;
       const request = ++danmakuRequest;
       danmakuItems.value = [];
+      refreshDanmakuEngine();
       danmakuStatus.value = '弹幕加载中';
       try {
         const response = await fetch(`/api/danmaku/${encodeURIComponent(seriesId)}/${encodeURIComponent(vid)}${force ? '?fresh=1' : ''}`);
@@ -130,6 +190,7 @@ createApp({
         const data = await response.json();
         if (request !== danmakuRequest) return;
         danmakuItems.value = Array.isArray(data.items) ? data.items : [];
+        refreshDanmakuEngine();
         danmakuStatus.value = data.notice || (data.success ? `弹幕 ${danmakuItems.value.length} 条` : '弹幕加载失败');
       } catch (_) {
         if (request === danmakuRequest) danmakuStatus.value = '弹幕加载失败';
@@ -137,7 +198,8 @@ createApp({
     }
     function toggleDanmaku() {
       danmakuEnabled.value = !danmakuEnabled.value;
-      if (danmakuEnabled.value) { loadDanmaku(true); startDanmakuAnimation(); }
+      savePreferences({ danmakuEnabled: danmakuEnabled.value });
+      if (danmakuEnabled.value) { loadDanmaku(true); nextTick(startDanmakuAnimation); }
       else { stopDanmakuAnimation(); danmakuRequest++; danmakuKey = ''; danmakuItems.value = []; }
     }
     // 全剧统一点赞数档位，500 赞及以上使用最高热度颜色。
@@ -149,21 +211,7 @@ createApp({
       if (likes >= 1) return '#a8dcff';
       return '#ffffff';
     }
-    const danmakuDuration = 10;
-    const visibleDanmaku = computed(() => {
-      const vid = activeEpisodes.value.find(e => e.vid_index === activeEpisodeIndex.value)?.vid;
-      if (!danmakuEnabled.value || danmakuKey !== `${activeSeries.value?.series_id}:${vid}`) return [];
-      const now = danmakuClock.value, rows = Number(danmakuRows.value);
-      const free = Array(rows).fill(-Infinity), result = [];
-      for (const [index, item] of danmakuItems.value.entries()) {
-        if (item.time > now) break;
-        const lane = free.findIndex(t => item.time >= t);
-        if (lane < 0) continue;
-        free[lane] = item.time + danmakuDuration;
-        if (now - item.time < danmakuDuration) result.push({ ...item, color: danmakuColor(item), index, lane, progress: (now - item.time) / danmakuDuration });
-      }
-      return result;
-    });
+    watch([danmakuLayer, videoEl], refreshDanmakuEngine, { flush: 'post' });
     const showAboutModal = ref(false);
     const appVersion = ref('');
     const showShortcutsModal = ref(false);
@@ -476,9 +524,45 @@ createApp({
       }
     }
 
+    function loadSearchHistory() {
+      const revision = searchHistoryRevision;
+      searchHistoryQueue = searchHistoryQueue.then(async () => {
+        const response = await fetch('/api/search-history');
+        if (!response.ok) throw new Error('搜索历史读取失败');
+        const data = await response.json();
+        if (revision === searchHistoryRevision && Array.isArray(data)) searchHistory.value = data;
+      }).catch(() => {});
+    }
+
+    function updateSearchHistory(action, keyword = '') {
+      if (action !== 'clear' && (!keyword || keyword.length > 200)) return;
+      const revision = ++searchHistoryRevision;
+      const rest = searchHistory.value.filter(item => item !== keyword);
+      searchHistory.value = action === 'clear' ? [] : action === 'add' ? [keyword, ...rest].slice(0, 10) : rest;
+      searchHistoryQueue = searchHistoryQueue.then(async () => {
+        const response = await fetch('/api/search-history', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, keyword })
+        });
+        if (!response.ok) throw new Error('搜索历史保存失败');
+        const data = await response.json();
+        if (revision === searchHistoryRevision && Array.isArray(data)) searchHistory.value = data;
+      }).catch(() => { notify('搜索历史保存失败'); });
+    }
+
+    function selectSearchHistory(keyword) {
+      searchKeyword.value = keyword;
+      handleSearch();
+    }
+
+    function onSearchFocusOut(event) {
+      if (!event.currentTarget.contains(event.relatedTarget)) showSearchHistory.value = false;
+    }
+
     async function handleSearch() {
       if (!searchKeyword.value.trim()) return;
       submittedKeyword = searchKeyword.value.trim();
+      showSearchHistory.value = false;
+      updateSearchHistory('add', submittedKeyword);
       currentTab.value = 'search';
       currentPage.value = 1;
       catalogError.value = null;
@@ -867,8 +951,8 @@ createApp({
     // ================= 沉浸式剧场与播放逻辑 =================
 
     function resetPlayback() {
+      lastNearEndPrefetch = 0;
       stopDanmakuAnimation();
-      danmakuClock.value = 0;
       progressReady = false;
       pendingResumeSec = 0;
       currentTime.value = 0;
@@ -1051,6 +1135,7 @@ createApp({
     function toggleMute() {
       if (!videoEl.value) return;
       isMuted.value = !isMuted.value;
+      savePreferences({ isMuted: isMuted.value });
       videoEl.value.muted = isMuted.value;
       keepPlayerFocus();
     }
@@ -1059,6 +1144,7 @@ createApp({
     const fitMode = ref('contain');
     function toggleFitMode() {
       fitMode.value = fitMode.value === 'contain' ? 'cover' : 'contain';
+      savePreferences({ fitMode: fitMode.value });
       keepPlayerFocus();
     }
 
@@ -1135,7 +1221,6 @@ createApp({
     function onPause(event) {
       if (event && event.target !== videoEl.value) return;
       isPlaying.value = false;
-      stopDanmakuAnimation();
       if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused';
       saveProgressNow();
       if (isMiniMode.value) refreshControlsForPlayback();
@@ -1173,7 +1258,15 @@ createApp({
       if (event && event.target !== videoEl.value) return;
       if (videoEl.value) {
         currentTime.value = videoEl.value.currentTime || 0;
-        danmakuClock.value = currentTime.value;
+        const rate = Number(videoEl.value.playbackRate) || 1;
+        const remaining = (duration.value - currentTime.value) / rate;
+        if (isPlaying.value && Number.isFinite(remaining) && remaining > 0 && remaining <= 45 && Date.now() - lastNearEndPrefetch >= 20000) {
+          const next = activeEpisodes.value.find(ep => ep.vid_index === activeEpisodeIndex.value + 1);
+          if (next?.vid) {
+            lastNearEndPrefetch = Date.now();
+            fetch(`/api/prefetch/${encodeURIComponent(next.vid)}`, { method: 'POST' }).catch(() => {});
+          }
+        }
         // 计算缓冲进度
         if (videoEl.value.buffered.length > 0 && duration.value > 0) {
           const bufferedEnd = videoEl.value.buffered.end(videoEl.value.buffered.length - 1);
@@ -1379,6 +1472,7 @@ createApp({
     }
 
     function handleGlobalPointerDown(e) {
+      if (showDanmakuSettings.value && !e.target?.closest?.('.danmaku-control')) showDanmakuSettings.value = false;
       if (viewMode.value !== 'theater') return;
       if (isTextEditingTarget(e.target)) return;
       const btn = e.target?.closest?.('button');
@@ -1412,6 +1506,8 @@ createApp({
     }
 
     onMounted(() => {
+      loadPreferences();
+      loadSearchHistory();
       loadCatalog();
       window.addEventListener('keydown', handleKeyDown);
       window.addEventListener('click', handleGlobalClick);
@@ -1464,13 +1560,13 @@ createApp({
     });
 
     return {
-      danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuStatus, visibleDanmaku, toggleDanmaku, loadDanmaku,
+      savePreferences, danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuStatus, danmakuLayer, danmakuColor, toggleDanmaku, loadDanmaku,
       toastText, osdMessage, sidebarOpen, isScrubbing, previewTime, previewPercent, showPreview,
       isFullscreen, isMiniMode, miniModeAvailable, toggleMiniMode, isControlsHidden, playerControlsEl, miniRestoreBtnEl, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove, handleControlsPointerEnter, handleControlsPointerLeave, holdControls, releaseControls,
       previewSeek, seekFromSlider, startScrubbing, finishScrubbing,
       viewMode,
       currentTab,
-      searchKeyword,
+      searchKeyword, searchHistory, showSearchHistory, updateSearchHistory, selectSearchHistory, onSearchFocusOut,
       hotTags,
       currentDramas,
       currentPage,

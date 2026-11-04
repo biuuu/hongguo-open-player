@@ -178,6 +178,23 @@ async function buildWindow() {
   view.webContents.on('did-start-navigation', (_event, _url, isSameDocument, isMainFrame) => {
     if (miniWindow && isMainFrame && !isSameDocument) restoreMainWindow();
   });
+  let recoveryPending = false;
+  view.webContents.on('render-process-gone', async (_event, details) => {
+    if (details.reason === 'clean-exit' || recoveryPending || mainWindow !== window || window.isDestroyed?.()) return;
+    recoveryPending = true;
+    try {
+      const result = await dialog.showMessageBox(miniWindow || window, {
+        type: 'warning', title: '播放器界面已停止', message: '播放器界面意外停止运行',
+        detail: '可以重新加载界面，播放进度将从最近保存的位置恢复。',
+        buttons: ['重新加载', '稍后处理'], defaultId: 0, cancelId: 1, noLink: true
+      });
+      if (result.response === 0 && mainWindow === window && playerView === view && !window.isDestroyed() && !view.webContents.isDestroyed()) view.webContents.reload();
+    } catch (error) {
+      console.error('Renderer recovery failed:', error);
+    } finally {
+      recoveryPending = false;
+    }
+  });
   window.on('closed', () => {
     if (mainWindow === window) mainWindow = null;
     if (playerView === view) playerView = null;

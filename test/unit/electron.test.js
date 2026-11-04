@@ -47,7 +47,7 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
       this.webContents.isDestroyed = () => !!this.closed;
       this.webContents.close = () => { this.closed = true; };
       this.webContents.send = channel => { this.sent = channel; };
-      this.webContents.reload = () => { this.reloaded = true; };
+      this.webContents.reload = () => { this.reloads = (this.reloads || 0) + 1; };
       this.webContents.reloadIgnoringCache = () => { this.forceReloaded = true; };
       this.webContents.toggleDevTools = () => { this.devtools = true; };
       this.webContents.getZoomLevel = () => this.zoom || 0;
@@ -59,6 +59,7 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   let starts = 0;
   let lastMenuTemplate = [];
   let openedUrl = null;
+  const dialogs = [];
   const context = { console, process: { platform, env: {} }, __dirname: '/repo/src/electron',
     setTimeout: fn => { saveTimer = fn; return fn; }, clearTimeout: () => { saveTimer = null; },
     require(name) {
@@ -67,7 +68,7 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
         ipcMain: { handle(name, handler) { assert.equal(name, 'set-mini-mode'); miniHandler = handler; } },
         Menu: { buildFromTemplate(tmpl) { lastMenuTemplate = tmpl; return tmpl; }, setApplicationMenu() {} },
         shell: { openExternal: async (url) => { openedUrl = url; }, openPath: async () => {} },
-        dialog: { showErrorBox() {}, showMessageBox: async () => ({ response: 0 }) } };
+        dialog: { showErrorBox() {}, showMessageBox: async (parent, options) => { dialogs.push({ parent, options }); return { response: 0 }; } } };
       if (name === '../server/index.js') return { startServer: async () => { starts++; return { server: { close() {} }, port: 8899 }; } };
       if (name === '../server/services/logger') return require('../../src/server/services/logger');
       if (name === '../server/services/streamService') return { shutdown() {} };
@@ -78,6 +79,14 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   vm.runInNewContext(fs.readFileSync(require.resolve('../../src/electron/main.js'), 'utf8'), context);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(windows[0].shown, true);
+  views[0].webContents.emit('render-process-gone', {}, { reason: 'clean-exit' });
+  views[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+  views[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(views[0].reloads, 1);
+  assert.equal(dialogs.length, 1);
+  assert.equal(dialogs[0].parent, windows[0]);
+  assert.ok(require('../../package.json').build.files.includes('build/icon.png'));
   if (platform === 'win32') {
     assert.equal(windows[0].options.titleBarStyle, 'hidden');
     assert.equal(windows[0].options.titleBarOverlay.height, 40);
@@ -100,6 +109,10 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   assert.equal(original.shown, false);
   assert.equal(mini.child, view);
   assert.equal(mini.shown, true);
+  view.webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(dialogs[1].parent, mini);
+  assert.equal(view.reloads, 2);
   mini.size = [500, 300];
   mini.position = [220, 180];
   mini.emit('resize');
@@ -137,7 +150,7 @@ for (const platform of ['darwin', 'win32', 'linux']) test(`desktop lifecycle and
   for (const label of ['重新加载', '强制重新加载', '开发者工具', '放大']) {
     viewMenu.submenu.find(item => item.label === label).click();
   }
-  assert.equal(view.reloaded, true);
+  assert.equal(view.reloads, 3);
   assert.equal(view.forceReloaded, true);
   assert.equal(view.devtools, true);
   assert.equal(view.zoom, 0.5);

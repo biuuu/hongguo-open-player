@@ -170,6 +170,13 @@ app.get('/api/play/:vid', async (req, res) => {
  * 5. 本地流媒体解密播放代理 (核心)
  * 支持 Range 请求，边下边解边播，支持预加载
  */
+app.post('/api/prefetch/:vid', (req, res) => {
+  const { vid } = req.params;
+  if (!/^\d{1,30}$/.test(vid)) return res.status(400).json({ error: '无效的分集编号' });
+  streamService.prefetch(vid, 'auto', true, 45000);
+  res.sendStatus(202);
+});
+
 app.get('/api/stream/:vid', (req, res) => {
   const { vid } = req.params;
   streamService.handleStream(req, res, vid);
@@ -178,6 +185,21 @@ app.get('/api/stream/:vid', (req, res) => {
 /**
  * 6. 播放进度与历史
  */
+app.get('/api/preferences', (_req, res) => res.json(storeService.getPreferences()));
+app.post('/api/preferences', async (req, res) => {
+  try { res.json(await storeService.updatePreferences(req.body)); }
+  catch (err) { sendApiError(res, err); }
+});
+
+app.get('/api/search-history', (_req, res) => res.json(storeService.getSearchHistory()));
+app.post('/api/search-history', async (req, res) => {
+  try {
+    res.json(await storeService.updateSearchHistory(req.body?.action, req.body?.keyword));
+  } catch (err) {
+    sendApiError(res, err);
+  }
+});
+
 app.get('/api/history', (req, res) => {
   res.json(storeService.getHistory());
 });

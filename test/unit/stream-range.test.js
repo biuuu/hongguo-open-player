@@ -87,3 +87,84 @@ test('getStreamingPlan falls back to next candidate when first candidate returns
     rangeMedia.prepareRangeMedia = originalPrepare;
   }
 });
+
+test('near-end prefetch can refresh a plan that expires before playback', async () => {
+  const service = new StreamService();
+  const appSource = require('../../src/server/native/app-source');
+  const rangeMedia = require('../../src/server/services/rangeMedia');
+  const originalFetch = appSource.fetchAppPlayUrl, originalPrepare = rangeMedia.prepareRangeMedia;
+  const oldPlan = { bytes: 5 }, newPlan = { bytes: 5 };
+  let calls = 0;
+  service.plans.set('123:auto', { plan: oldPlan, expires: Date.now() + 30000 });
+  appSource.fetchAppPlayUrl = async () => { calls++; return { url: 'https://example.com/video' }; };
+  rangeMedia.prepareRangeMedia = async () => newPlan;
+  try {
+    assert.equal(await service.getStreamingPlan('123', 'auto', new AbortController().signal), oldPlan);
+    assert.equal(await service.getStreamingPlan('123', 'auto', new AbortController().signal, 45000), newPlan);
+    assert.equal(calls, 1);
+    assert.equal(await service.getStreamingPlan('123', 'auto', new AbortController().signal, 45000), newPlan);
+    assert.equal(calls, 1);
+  } finally {
+    appSource.fetchAppPlayUrl = originalFetch;
+    rangeMedia.prepareRangeMedia = originalPrepare;
+  }
+});
+
+test('rapid episode changes let the latest request wait for cancelled streams', async () => {
+  const { EventEmitter } = require('node:events');
+  const service = new StreamService();
+  service.getStreamingPlan = (vid, _quality, signal) => {
+    if (vid === '4') return Promise.resolve(null);
+    return new Promise((_resolve, reject) => {
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  };
+  service.handleBufferedStream = async (_req, res) => { res.writeHead(200); res.end(); };
+  function response() {
+    const res = new EventEmitter();
+    res.writeHead = status => { res.status = status; };
+    res.end = () => { res.writableEnded = true; };
+    return res;
+  }
+  const previous = Array.from({ length: 3 }, () => response());
+  const tasks = previous.map((res, i) => service.handleStream({ headers: {}, query: {} }, res, String(i + 1)));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(service.activeStreams, 3);
+  for (const res of previous) { res.destroyed = true; res.emit('close'); }
+  const latest = response();
+  const newest = service.handleStream({ headers: {}, query: {} }, latest, '4');
+  await Promise.all([...tasks, newest]);
+  assert.equal(latest.status, 200);
+  assert.equal(service.activeStreams, 0);
+  assert.equal(service.waitingStreams.length, 0);
+});
+
+test('a disconnected waiting stream leaves the bounded queue', async () => {
+  const { EventEmitter } = require('node:events');
+  const service = new StreamService();
+  service.activeStreams = 3;
+  const res = new EventEmitter();
+  res.writeHead = () => { throw new Error('closed request must not receive a response'); };
+  res.end = () => {};
+  const pending = service.handleStream({ headers: {}, query: {} }, res, '4');
+  assert.equal(service.waitingStreams.length, 1);
+  res.destroyed = true;
+  res.emit('close');
+  await pending;
+  assert.equal(service.waitingStreams.length, 0);
+  assert.equal(service.activeStreams, 3);
+});
+
+test('stream admission limits the number of waiting requests', async () => {
+  const { EventEmitter } = require('node:events');
+  const service = new StreamService();
+  service.activeStreams = 3;
+  const responses = Array.from({ length: 6 }, () => new EventEmitter());
+  const waiting = responses.map(res => service.acquireStreamSlot(res));
+  assert.equal(service.waitingStreams.length, 6);
+  assert.equal(service.acquireStreamSlot(new EventEmitter()), false);
+  for (const res of responses) res.emit('close');
+  assert.deepEqual(await Promise.all(waiting), [false, false, false, false, false, false]);
+  assert.equal(service.waitingStreams.length, 0);
+});

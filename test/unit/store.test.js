@@ -70,3 +70,38 @@ test('multiple store instances sharing dataDir do not overwrite each other histo
   assert.equal(storeA.isFavorite('200'), true);
   assert.equal(storeB.getSeriesProgress('100')?.position_sec, 14);
 });
+
+test('search history is bounded, deduplicated, persistent and removable', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'player-search-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(dir);
+  await store.updateProgress({ series_id: '123', position_sec: 9 });
+  for (let i = 0; i < 12; i++) await store.updateSearchHistory('add', `剧集${i}`);
+  await store.updateSearchHistory('add', ' 剧集5 ');
+  let reloaded = new Store(dir);
+  assert.equal(reloaded.getSearchHistory().length, 10);
+  assert.equal(reloaded.getSearchHistory()[0], '剧集5');
+  assert.equal(reloaded.getSearchHistory().filter(x => x === '剧集5').length, 1);
+  assert.equal(reloaded.getSeriesProgress('123').position_sec, 9);
+  await reloaded.updateSearchHistory('remove', '剧集5');
+  assert.ok(!reloaded.getSearchHistory().includes('剧集5'));
+  await reloaded.updateSearchHistory('clear');
+  assert.deepEqual(new Store(dir).getSearchHistory(), []);
+  assert.throws(() => store.updateSearchHistory('add', '  '));
+});
+
+test('player preferences persist with existing data and reject invalid values', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'player-prefs-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(dir);
+  await store.updateProgress({ series_id: '123', position_sec: 8 });
+  await store.updatePreferences({ volume: 0, isMuted: true, danmakuEnabled: false, danmakuRows: 5, danmakuOpacity: 0.4, playbackRate: '1.5', fitMode: 'cover' });
+  await store.updatePreferences({ volume: 0.5 });
+  const loaded = new Store(dir);
+  assert.equal(loaded.getPreferences().volume, 0.5);
+  assert.equal(loaded.getPreferences().danmakuEnabled, false);
+  assert.equal(loaded.getPreferences().fitMode, 'cover');
+  assert.equal(loaded.getSeriesProgress('123').position_sec, 8);
+  assert.throws(() => loaded.updatePreferences({ volume: 2 }));
+  assert.throws(() => loaded.updatePreferences({ arbitrary: true }));
+});
