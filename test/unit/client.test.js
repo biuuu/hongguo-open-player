@@ -1282,6 +1282,38 @@ test('search history selection searches again and supports removal', async () =>
   assert.equal(stored.length, 0);
 });
 
+test('search history controls retain focus in theater without changing player controls', () => {
+  const listeners = {};
+  let playerFocuses = 0;
+  let blurs = 0;
+  const player = { focus() { playerFocuses++; } };
+  const doc = {
+    documentElement: { classList: { add() {} } },
+    addEventListener(name, fn) { listeners[name] = fn; },
+    querySelector(selector) { return selector === '.player-container' ? player : null; }
+  };
+  const state = client(async () => response([]), {
+    document: doc,
+    window: { addEventListener(name, fn) { listeners[name] = fn; } }
+  });
+  state.mountForTest();
+  state.viewMode.value = 'theater';
+  const button = inSearch => ({
+    tagName: 'BUTTON',
+    blur() { blurs++; },
+    closest(selector) { return selector === '.search-box' ? (inSearch ? this : null) : selector === 'button' ? this : null; }
+  });
+  const historyButton = button(true);
+  for (const name of ['pointerdown', 'focusin', 'click']) listeners[name]({ target: historyButton });
+  assert.equal(blurs, 0);
+  assert.equal(playerFocuses, 0);
+
+  const playerButton = button(false);
+  for (const name of ['pointerdown', 'focusin', 'click']) listeners[name]({ target: playerButton });
+  assert.equal(blurs, 3);
+  assert.equal(playerFocuses, 2);
+});
+
 test('late preference loading preserves changes made by the user', async () => {
   let finishPreferences;
   const updates = [];
@@ -1300,11 +1332,20 @@ test('late preference loading preserves changes made by the user', async () => {
   assert.equal(updates[0].playbackRate, '2.0');
 });
 
-test('prefetch is requested near the end using remaining playback time', async () => {
+test('prefetch is requested near the end using remaining playback time and includes next_vids', async () => {
   const calls = [];
   const state = client(async (url, options) => {
     calls.push([url, options]);
-    if (url.startsWith('/api/series/')) return response({ series_id: '123', episodes: [{ vid: '111', vid_index: 1 }, { vid: '222', vid_index: 2 }] });
+    if (url.startsWith('/api/series/')) return response({
+      series_id: '123',
+      episodes: [
+        { vid: '111', vid_index: 1 },
+        { vid: '222', vid_index: 2 },
+        { vid: '333', vid_index: 3 },
+        { vid: '444', vid_index: 4 },
+        { vid: '555', vid_index: 5 }
+      ]
+    });
     return response({ success: true, items: [] });
   });
   await state.openTheater({ series_id: '123' });
@@ -1312,10 +1353,10 @@ test('prefetch is requested near the end using remaining playback time', async (
   state.duration.value = 200;
   state.isPlaying.value = true;
   state.onTimeUpdate();
-  assert.equal(calls.filter(([url]) => url === '/api/prefetch/222').length, 0);
+  assert.equal(calls.filter(([url]) => url.startsWith('/api/prefetch/222')).length, 0);
   state.videoEl.value.currentTime = 112;
   state.onTimeUpdate(); state.onTimeUpdate();
-  assert.equal(calls.filter(([url, options]) => url === '/api/prefetch/222' && options.method === 'POST').length, 1);
+  assert.equal(calls.filter(([url, options]) => url === '/api/prefetch/222?next_vids=333%2C444%2C555' && options.method === 'POST').length, 1);
 });
 
 test('danmaku settings close on outside pointer interactions but remain open inside', () => {
@@ -1334,4 +1375,54 @@ test('danmaku settings close on outside pointer interactions but remain open ins
   state.showDanmakuSettings.value = true;
   listeners.pointerdown({ target: { tagName: 'BUTTON', closest: () => null } });
   assert.equal(state.showDanmakuSettings.value, false);
+});
+
+test('currentStreamUrl includes next_vid and next_vids from upcoming episodes', async () => {
+  const state = client(async () => response({}));
+  state.activeEpisodes.value = [
+    { vid: '101', vid_index: 1 },
+    { vid: '102', vid_index: 2 },
+    { vid: '103', vid_index: 3 },
+    { vid: '104', vid_index: 4 }
+  ];
+  state.activeEpisodeIndex.value = 1;
+  assert.equal(state.currentStreamUrl.value, '/api/stream/101?next_vid=102&next_vids=102%2C103%2C104');
+
+  state.activeEpisodeIndex.value = 2;
+  assert.equal(state.currentStreamUrl.value, '/api/stream/102?next_vid=103&next_vids=103%2C104');
+
+  state.activeEpisodeIndex.value = 3;
+  assert.equal(state.currentStreamUrl.value, '/api/stream/103?next_vid=104');
+
+  state.activeEpisodeIndex.value = 4;
+  assert.equal(state.currentStreamUrl.value, '/api/stream/104');
+});
+
+test('retryCurrentEpisode increments streamRefreshTick and attaches refresh=1, switchEpisode resets it', async () => {
+  const state = client(async () => response({}));
+  state.activeEpisodes.value = [
+    { vid: '101', vid_index: 1 },
+    { vid: '102', vid_index: 2 }
+  ];
+  state.activeEpisodeIndex.value = 1;
+  assert.equal(state.currentStreamUrl.value, '/api/stream/101?next_vid=102');
+
+  state.retryCurrentEpisode();
+  assert.match(state.currentStreamUrl.value, /refresh=1/);
+
+  state.switchEpisode(state.activeEpisodes.value[1]);
+  assert.equal(state.currentStreamUrl.value, '/api/stream/102');
+  assert.ok(!state.currentStreamUrl.value.includes('refresh=1'));
+});
+
+test('video error handler provides specific guidance for MediaError code 2 stream read failures', () => {
+  const state = client(async () => response({}));
+  state.videoEl.value = {
+    error: {
+      code: 2,
+      message: 'MEDIA_ELEMENT_ERROR: Format error'
+    }
+  };
+  state.onVideoError();
+  assert.equal(state.videoErrorMessage.value, '视频流读取中断（网络或取流异常）；请点击“重试本集”或切换分集');
 });

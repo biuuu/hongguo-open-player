@@ -27,6 +27,8 @@ class StreamService {
     this.activeStreams = 0;
     this.waitingStreams = [];
     this.streamControllers = new Set();
+    this.quickAborts = new Map();
+    this.consumedRefreshes = new Map();
   }
 
   /**
@@ -104,16 +106,54 @@ class StreamService {
   }
 
   /**
+   * CDN 智能排序：在保持编码（H.264/HEVC）与画质层级的前提下，在同一层级内将受限速的 v9-reading-video 节点降权
+   */
+  sortVariantsByCdnPriority(variants) {
+    if (!Array.isArray(variants) || variants.length <= 1) return variants ? variants.slice() : [];
+
+    const tierKey = (v) => {
+      const codec = String(v?.codec || '').toLowerCase();
+      const quality = String(v?.quality || '').toLowerCase();
+      const width = Number(v?.width || 0);
+      const height = Number(v?.height || 0);
+      return `${codec}:${quality}:${width}x${height}`;
+    };
+
+    const tierOrder = [];
+    const tierMap = new Map();
+    for (const v of variants) {
+      const key = tierKey(v);
+      if (!tierMap.has(key)) {
+        tierMap.set(key, []);
+        tierOrder.push(key);
+      }
+      tierMap.get(key).push(v);
+    }
+
+    const result = [];
+    for (const key of tierOrder) {
+      const group = tierMap.get(key);
+      const normal = [];
+      const throttled = [];
+      for (const v of group) {
+        if (/v9-reading-video/i.test(v?.url || '')) {
+          throttled.push(v);
+        } else {
+          normal.push(v);
+        }
+      }
+      result.push(...normal, ...throttled);
+    }
+    return result;
+  }
+
+  /**
    * 智能下载：排序边缘 CDN 节点并支持 1.5s 备用节点竞速，解决个别主域名 (如 v9-reading-video) 限速 30 秒卡顿问题
    */
   async downloadFastestMedia(variants, defaultVariant, timeoutMs = 25000, signal) {
     const list = Array.isArray(variants) && variants.length > 0 ? variants : [defaultVariant];
-    // 智能排序：优先排除受限速的主节点，优先选择边缘高速 CDN
-    const sorted = [...list].sort((a, b) => {
-      const aBad = a.url.includes('v9-reading-video') ? 1 : 0;
-      const bBad = b.url.includes('v9-reading-video') ? 1 : 0;
-      return aBad - bBad;
-    });
+    // 智能排序：在保持编码与画质层级的前提下，优先排除同层级受限速的节点
+    const sorted = this.sortVariantsByCdnPriority(list);
 
     const abortControllers = sorted.map(() => new AbortController());
 
@@ -257,12 +297,14 @@ class StreamService {
     for (const controller of this.streamControllers) controller.abort(new Error('Player stopped'));
     this.cache.clear();
     this.plans.clear();
+    this.quickAborts.clear();
+    this.consumedRefreshes.clear();
   }
 
   /**
    * 预加载下一集 (Prefetch)
    */
-  prefetch(vid, quality = 'auto', metadataOnly = false, minValidityMs = 0) {
+  prefetch(vid, quality = 'auto', metadataOnly = false, minValidityMs = 0, nextVids = []) {
     if (!vid || !/^\d{1,30}$/.test(String(vid))) return;
     const key = `${vid}:${quality}`;
     if (metadataOnly && this.plans.get(key)?.expires > Date.now() + minValidityMs) return;
@@ -279,7 +321,7 @@ class StreamService {
       if (metadataOnly) {
         const controller = new AbortController();
         this.planPrefetch = controller;
-        this.getStreamingPlan(String(vid), quality, controller.signal, minValidityMs).then(() => {
+        this.getStreamingPlan(String(vid), quality, controller.signal, minValidityMs, nextVids).then(() => {
           logger.info('StreamService', `[Prefetch] 成功预热下一集流分片元数据: vid=${vid}`);
         }).catch(error => {
           if (!controller.signal.aborted) logger.warn('StreamService', `[Prefetch] 下一集元数据预热失败: ${error.message}`);
@@ -311,16 +353,19 @@ class StreamService {
   /**
    * 处理 HTTP Range 播放请求 (边下边解边播的核心接口)
    */
-  async getStreamingPlan(vid, quality, signal, minValidityMs = 0) {
+  async getStreamingPlan(vid, quality, signal, minValidityMs = 0, nextVids = []) {
     const key = `${vid}:${quality}`;
     const cached = this.plans.get(key);
     if (cached?.expires > Date.now() + minValidityMs) { this.plans.delete(key); this.plans.set(key, cached); return cached.plan; }
     const t0 = Date.now();
     logger.info('StreamService', `开始构建流式分片播放计划: vid=${vid}, quality=${quality}`);
-    const info = await appSource.fetchAppPlayUrl(vid, { quality, allowLowerQuality: true, signal });
+    const info = await appSource.fetchAppPlayUrl(vid, { quality, allowLowerQuality: true, signal, nextVids });
     let lastError;
     let hasRangeUnsupported = false;
-    for (const variant of info.variants?.length ? info.variants : [info]) {
+    const rawVariants = info.variants?.length ? info.variants : [info];
+    // 智能排序：在保持编码与画质层级的前提下，优先排除同层级受限速的节点 (如 v9-reading-video)
+    const variants = this.sortVariantsByCdnPriority(rawVariants);
+    for (const variant of variants) {
       signal.throwIfAborted();
       try {
         const plan = await rangeMedia.prepareRangeMedia({ ...variant, contentKey: variant.contentKey || info.contentKey }, this.requestOptions, signal);
@@ -394,15 +439,44 @@ class StreamService {
     const disconnected = () => { if (!res.writableEnded) controller.abort(new Error('Playback disconnected')); };
     res.once?.('close', disconnected);
     const t0 = Date.now();
+    const refreshToken = req.query?.refresh ? String(req.query.refresh).trim() : '';
+    const isRefresh = Boolean(refreshToken && refreshToken !== '0' && refreshToken !== 'false');
     const quality = normalizeDownloadQuality(req.query?.quality || 'auto');
     const planKey = `${vid}:${quality}`;
+    if (isRefresh) {
+      const refreshKey = `${vid}:${quality}:${refreshToken}`;
+      if (!this.consumedRefreshes.has(refreshKey)) {
+        this.consumedRefreshes.set(refreshKey, Date.now());
+        this.plans.delete(planKey);
+        this.plans.delete(String(vid));
+        this.cache.delete(planKey);
+        this.cache.delete(String(vid));
+        this.quickAborts.delete(planKey);
+        appSource.clearEntryCache?.(vid);
+        logger.info('StreamService', `收到单次有效刷新指令，已清空播放计划与模型缓存: vid=${vid}, token=${refreshToken}`);
+        while (this.consumedRefreshes.size > 200) {
+          this.consumedRefreshes.delete(this.consumedRefreshes.keys().next().value);
+        }
+      }
+    }
+    const nextVids = [];
+    if (req.query?.next_vids) {
+      for (const v of req.query.next_vids.split(',')) {
+        const clean = v.trim();
+        if (/^\d{1,30}$/.test(clean) && !nextVids.includes(clean)) nextVids.push(clean);
+      }
+    }
+    if (req.query?.next_vid) {
+      const clean = String(req.query.next_vid).trim();
+      if (/^\d{1,30}$/.test(clean) && !nextVids.includes(clean)) nextVids.push(clean);
+    }
     try {
       logger.info('StreamService', `收到流媒体Range请求: vid=${vid}, Range=${req.headers.range || '全量'}, quality=${quality}`);
       if (this.cache.has(planKey) || this.cache.has(String(vid))) {
         logger.info('StreamService', `命中完整视频内存缓存，直接进入缓冲分片播放: vid=${vid}, quality=${quality}`);
         return await this.handleBufferedStream(req, res, vid);
       }
-      const plan = await this.getStreamingPlan(vid, quality, controller.signal);
+      const plan = await this.getStreamingPlan(vid, quality, controller.signal, 0, nextVids);
       if (!plan) return await this.handleBufferedStream(req, res, vid);
       const total = plan.size;
       let start = 0, end = total - 1;
@@ -427,7 +501,8 @@ class StreamService {
       if (req.method === 'HEAD') { res.end(); return; }
       await pipeline(Readable.from(plan.read(start, end, controller.signal), { objectMode: false, highWaterMark: 64 * 1024 }), res);
       logger.info('StreamService', `流式分片传输完成: vid=${vid}, 区间=${start}-${end}/${total}, 耗时=${Date.now() - t0}ms`);
-      this.prefetch(req.query?.next_vid, quality, true);
+      const followVids = nextVids.filter(v => v !== String(req.query?.next_vid) && v !== String(vid));
+      this.prefetch(req.query?.next_vid, quality, true, 0, followVids);
     } catch (error) {
       const isClientAbort = controller.signal.aborted ||
         error.name === 'AbortError' ||
@@ -437,6 +512,7 @@ class StreamService {
 
       if (!isClientAbort) {
         this.plans.delete(planKey);
+        this.quickAborts.delete(planKey);
         logger.error('StreamService', `流媒体播放异常 vid=${vid}: ${error.message}`);
         if (!res.destroyed) {
           if (!res.headersSent) {
@@ -453,6 +529,25 @@ class StreamService {
         }
       } else {
         logger.info('StreamService', `客户端断开连接 (Seek/切集): vid=${vid}`);
+        const duration = Date.now() - t0;
+        const history = this.quickAborts.get(planKey) || { count: 0, lastTime: 0 };
+        const isRapid = duration < 300 && (Date.now() - history.lastTime < 3000);
+        if (isRapid) {
+          history.count++;
+          history.lastTime = Date.now();
+          this.quickAborts.set(planKey, history);
+          if (history.count >= 2) {
+            this.plans.delete(planKey);
+            this.plans.delete(String(vid));
+            this.cache.delete(planKey);
+            this.cache.delete(String(vid));
+            this.quickAborts.delete(planKey);
+            appSource.clearEntryCache?.(vid);
+            logger.warn('StreamService', `分集 ${vid} 连续发生快速断连 (${history.count}次)，可能为慢节点或解码受阻，已强制清除当前流计划与上游模型缓存`);
+          }
+        } else {
+          this.quickAborts.set(planKey, { count: 1, lastTime: Date.now() });
+        }
       }
     } finally {
       res.removeListener?.('close', disconnected);
@@ -473,7 +568,15 @@ class StreamService {
         res.removeListener?.('close', disconnected);
       }
       if (res.destroyed) return;
-      if (req.method === 'GET' && !res.destroyed) this.prefetch(req.query?.next_vid, req.query?.quality || 'auto');
+      const nextVids = [];
+      if (req.query?.next_vids) {
+        for (const v of req.query.next_vids.split(',')) {
+          const clean = v.trim();
+          if (/^\d{1,30}$/.test(clean) && !nextVids.includes(clean)) nextVids.push(clean);
+        }
+      }
+      const followVids = nextVids.filter(v => v !== String(req.query?.next_vid) && v !== String(vid));
+      if (req.method === 'GET' && !res.destroyed) this.prefetch(req.query?.next_vid, req.query?.quality || 'auto', false, 0, followVids);
       const total = buffer.length;
       const range = req.headers.range;
 

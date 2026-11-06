@@ -168,3 +168,169 @@ test('stream admission limits the number of waiting requests', async () => {
   assert.deepEqual(await Promise.all(waiting), [false, false, false, false, false, false]);
   assert.equal(service.waitingStreams.length, 0);
 });
+
+test('consecutive rapid client disconnections evict cached streaming plan and entryCache, enabling plan rebuild', async () => {
+  const { Writable } = require('node:stream');
+  const service = new StreamService();
+  const appSource = require('../../src/server/native/app-source');
+  let clearedVid = null;
+  const originalClear = appSource.clearEntryCache;
+  appSource.clearEntryCache = (vid) => { clearedVid = vid; };
+
+  const mockPlan = {
+    size: 100,
+    bytes: 100,
+    read: async function* () {
+      yield Buffer.from('chunk1');
+      throw Object.assign(new Error('premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' });
+    }
+  };
+  service.plans.set('vid-rapid:auto', { plan: mockPlan, expires: Date.now() + 90000 });
+
+  try {
+    // First abort (<300ms)
+    const res1 = new Writable({ write(chunk, enc, cb) { cb(); } });
+    res1.writeHead = () => {};
+    await service.handleStream({ headers: { range: 'bytes=0-50' } }, res1, 'vid-rapid');
+    assert.ok(service.plans.has('vid-rapid:auto'), 'Single abort should keep plan');
+    assert.equal(clearedVid, null);
+
+    // Second abort within 3 seconds (<300ms)
+    const res2 = new Writable({ write(chunk, enc, cb) { cb(); } });
+    res2.writeHead = () => {};
+    await service.handleStream({ headers: { range: 'bytes=0-50' } }, res2, 'vid-rapid');
+    assert.ok(!service.plans.has('vid-rapid:auto'), 'Consecutive rapid aborts should evict plan');
+    assert.equal(clearedVid, 'vid-rapid', 'Consecutive rapid aborts should evict entryCache');
+
+    // Next request triggers a plan rebuild rather than returning stale cached plan
+    let planRebuilt = false;
+    service.getStreamingPlan = async () => {
+      planRebuilt = true;
+      return { size: 10, bytes: 10, read: async function* () { yield Buffer.from('rebuilt012'); } };
+    };
+    const res3 = new Writable({ write(chunk, enc, cb) { cb(); } });
+    res3.writeHead = () => {};
+    await service.handleStream({ headers: { range: 'bytes=0-4' } }, res3, 'vid-rapid');
+    assert.equal(planRebuilt, true);
+  } finally {
+    appSource.clearEntryCache = originalClear;
+  }
+});
+
+test('refresh token is consumable once across multiple Range requests', async () => {
+  const { Writable } = require('node:stream');
+  const service = new StreamService();
+  const appSource = require('../../src/server/native/app-source');
+  const rangeMedia = require('../../src/server/services/rangeMedia');
+  let clearCount = 0;
+  let fetchCount = 0;
+  const originalClear = appSource.clearEntryCache;
+  const originalFetch = appSource.fetchAppPlayUrl;
+  const originalPrepare = rangeMedia.prepareRangeMedia;
+
+  appSource.clearEntryCache = () => { clearCount++; };
+  appSource.fetchAppPlayUrl = async () => {
+    fetchCount++;
+    return { url: 'https://v3-reading-video.douyinvod.com/video.mp4', variants: [{ url: 'https://v3-reading-video.douyinvod.com/video.mp4' }] };
+  };
+  rangeMedia.prepareRangeMedia = async () => ({
+    size: 10,
+    bytes: 10,
+    read: async function* () { yield Buffer.from('0123456789'); }
+  });
+
+  function createWritable() {
+    const res = new Writable({ write(chunk, enc, cb) { cb(); } });
+    res.writeHead = (code, headers) => { res.status = code; res.headers = headers; };
+    return res;
+  }
+
+  try {
+    service.plans.set('vid-refresh:auto', { plan: { bytes: 100, size: 100, read: async function* () {} }, expires: Date.now() + 90000 });
+
+    // First Range request with token 1: consumes token, clears cache, builds fresh plan
+    const res1 = createWritable();
+    await service.handleStream({ headers: { range: 'bytes=0-4' }, query: { refresh: '1' } }, res1, 'vid-refresh');
+    assert.equal(clearCount, 1);
+    assert.equal(fetchCount, 1);
+
+    // Second Range request with same token 1 (e.g. browser seeking or range chunking): token already consumed, reuses plan without clearing
+    const res2 = createWritable();
+    await service.handleStream({ headers: { range: 'bytes=5-9' }, query: { refresh: '1' } }, res2, 'vid-refresh');
+    assert.equal(clearCount, 1, 'Same refresh token should not trigger cache clearing again');
+    assert.equal(fetchCount, 1, 'Same refresh token should reuse the active plan without re-fetching');
+
+    // Third Range request with new token 2 (user clicked retry again): consumes new token, clears and rebuilds
+    const res3 = createWritable();
+    await service.handleStream({ headers: { range: 'bytes=0-4' }, query: { refresh: '2' } }, res3, 'vid-refresh');
+    assert.equal(clearCount, 2);
+    assert.equal(fetchCount, 2);
+  } finally {
+    appSource.clearEntryCache = originalClear;
+    appSource.fetchAppPlayUrl = originalFetch;
+    rangeMedia.prepareRangeMedia = originalPrepare;
+  }
+});
+
+test('sortVariantsByCdnPriority preserves codec and resolution tier precedence while deprioritizing v9 within each tier', () => {
+  const service = new StreamService();
+  const v1 = { codec: 'h264', quality: '1080p', width: 1080, height: 1920, url: 'http://v9-reading-video.fqnovelvod.com/v1.mp4' };
+  const v2 = { codec: 'h264', quality: '1080p', width: 1080, height: 1920, url: 'http://v3-reading-video.douyinvod.com/v2.mp4' };
+  const v3 = { codec: 'hevc', quality: '1080p', width: 1080, height: 1920, url: 'http://v3-reading-video.douyinvod.com/v3.mp4' };
+  const v4 = { codec: 'h264', quality: '720p', width: 720, height: 1280, url: 'http://v3-reading-video.douyinvod.com/v4.mp4' };
+
+  const sorted = service.sortVariantsByCdnPriority([v1, v2, v3, v4]);
+  // Within H.264 1080p, v2 (v3 CDN) is prioritized over v1 (v9 CDN)
+  assert.equal(sorted[0], v2);
+  assert.equal(sorted[1], v1);
+  // H.264 1080p v9 (v1) is NOT displaced behind HEVC (v3) or 720p (v4)
+  assert.equal(sorted[2], v3);
+  assert.equal(sorted[3], v4);
+});
+
+test('prefetch forwards nextVids to getStreamingPlan and handleStream passes followVids', async () => {
+  const service = new StreamService();
+  const prefetchCalls = [];
+  const planCalls = [];
+
+  service.getStreamingPlan = async (vid, quality, signal, minValidityMs, nextVids) => {
+    planCalls.push({ vid, quality, minValidityMs, nextVids });
+    return {
+      size: 10,
+      bytes: 10,
+      read: async function* () { yield Buffer.from('1234567890'); }
+    };
+  };
+
+  const originalSetTimeout = global.setTimeout;
+  try {
+    global.setTimeout = fn => {
+      fn();
+      return { unref() {} };
+    };
+
+    service.prefetch('102', 'auto', true, 45000, ['103', '104']);
+    assert.equal(planCalls.length, 1);
+    assert.deepEqual(planCalls[0], {
+      vid: '102',
+      quality: 'auto',
+      minValidityMs: 45000,
+      nextVids: ['103', '104']
+    });
+
+    service.prefetch = (...args) => prefetchCalls.push(args);
+
+    const { Writable } = require('node:stream');
+    const res = new Writable({ write(chunk, encoding, cb) { cb(); } });
+    res.writeHead = (code, headers) => { res.status = code; res.headers = headers; };
+    await service.handleStream({
+      headers: { range: 'bytes=0-4' },
+      query: { next_vid: '102', next_vids: '102,103,104' }
+    }, res, '101');
+
+    assert.equal(prefetchCalls.length, 1);
+    assert.deepEqual(prefetchCalls[0], ['102', 'auto', true, 0, ['103', '104']]);
+  } finally {
+    global.setTimeout = originalSetTimeout;
+  }
+});

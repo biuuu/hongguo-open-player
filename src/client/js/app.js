@@ -448,15 +448,22 @@ createApp({
 
     // 当前选集分组
     const currentGroup = ref({ start: 1, end: 30 });
+    const streamRefreshTick = ref(0);
 
     // 当前播放直链 (通过本地边下边解代理)
     const currentStreamUrl = computed(() => {
       const ep = activeEpisodes.value.find(e => e.vid_index === activeEpisodeIndex.value);
       if (!ep || !ep.vid) return '';
-      // 计算下一集的 vid 便于代理服务无感预加载
-      const nextEp = activeEpisodes.value.find(e => e.vid_index === activeEpisodeIndex.value + 1);
-      const nextParam = nextEp?.vid ? `?next_vid=${nextEp.vid}` : '';
-      return `/api/stream/${ep.vid}${nextParam}`;
+      // 计算后续分集便于服务端批量拉取与无感预加载
+      const nextEp1 = activeEpisodes.value.find(e => e.vid_index === activeEpisodeIndex.value + 1);
+      const nextEp2 = activeEpisodes.value.find(e => e.vid_index === activeEpisodeIndex.value + 2);
+      const nextEp3 = activeEpisodes.value.find(e => e.vid_index === activeEpisodeIndex.value + 3);
+      const nextList = [nextEp1?.vid, nextEp2?.vid, nextEp3?.vid].filter(Boolean);
+      const params = [];
+      if (nextEp1?.vid) params.push(`next_vid=${encodeURIComponent(nextEp1.vid)}`);
+      if (nextList.length > 1) params.push(`next_vids=${encodeURIComponent(nextList.join(','))}`);
+      if (streamRefreshTick.value > 0) params.push(`refresh=${streamRefreshTick.value}`);
+      return `/api/stream/${ep.vid}${params.length ? '?' + params.join('&') : ''}`;
     });
 
     const playedPercent = computed(() => {
@@ -1054,6 +1061,7 @@ createApp({
       saveProgressNow();
       resetPlayback();
       videoErrorMessage.value = '';
+      streamRefreshTick.value = 0;
       isBuffering.value = true;
       activeEpisodeIndex.value = ep.vid_index;
       loadDanmaku();
@@ -1264,7 +1272,12 @@ createApp({
           const next = activeEpisodes.value.find(ep => ep.vid_index === activeEpisodeIndex.value + 1);
           if (next?.vid) {
             lastNearEndPrefetch = Date.now();
-            fetch(`/api/prefetch/${encodeURIComponent(next.vid)}`, { method: 'POST' }).catch(() => {});
+            const next2 = activeEpisodes.value.find(ep => ep.vid_index === activeEpisodeIndex.value + 2);
+            const next3 = activeEpisodes.value.find(ep => ep.vid_index === activeEpisodeIndex.value + 3);
+            const next4 = activeEpisodes.value.find(ep => ep.vid_index === activeEpisodeIndex.value + 4);
+            const followVids = [next2?.vid, next3?.vid, next4?.vid].filter(Boolean);
+            const query = followVids.length ? `?next_vids=${encodeURIComponent(followVids.join(','))}` : '';
+            fetch(`/api/prefetch/${encodeURIComponent(next.vid)}${query}`, { method: 'POST' }).catch(() => {});
           }
         }
         // 计算缓冲进度
@@ -1317,6 +1330,8 @@ createApp({
             }
           }
         }
+      } else if (code === 2) {
+        videoErrorMessage.value = '视频流读取中断（网络或取流异常）；请点击“重试本集”或切换分集';
       } else {
         videoErrorMessage.value = '视频加载失败，请检查网络后重试';
       }
@@ -1324,6 +1339,7 @@ createApp({
 
     function retryCurrentEpisode() {
       videoErrorMessage.value = '';
+      streamRefreshTick.value++;
       if (videoEl.value) {
         videoEl.value.load();
         videoEl.value.play().catch(console.error);
@@ -1474,7 +1490,7 @@ createApp({
     function handleGlobalPointerDown(e) {
       if (showDanmakuSettings.value && !e.target?.closest?.('.danmaku-control')) showDanmakuSettings.value = false;
       if (viewMode.value !== 'theater') return;
-      if (isTextEditingTarget(e.target)) return;
+      if (isTextEditingTarget(e.target) || e.target?.closest?.('.search-box')) return;
       const btn = e.target?.closest?.('button');
       if (btn) {
         btn.blur?.();
@@ -1483,7 +1499,7 @@ createApp({
 
     function handleGlobalFocusIn(e) {
       if (viewMode.value !== 'theater') return;
-      if (isTextEditingTarget(e.target)) return;
+      if (isTextEditingTarget(e.target) || e.target?.closest?.('.search-box')) return;
       // 避免控制按钮、全屏按钮、选集方块或滑块截留焦点，保持焦点常驻在播放器主体上
       if (e.target?.tagName === 'BUTTON' || (e.target?.tagName === 'INPUT' && e.target.type === 'range') || e.target?.tagName === 'SELECT') {
         e.target.blur?.();
@@ -1497,7 +1513,7 @@ createApp({
         showAppMenu.value = false;
       }
       if (viewMode.value !== 'theater') return;
-      if (isTextEditingTarget(e.target)) return;
+      if (isTextEditingTarget(e.target) || e.target?.closest?.('.search-box')) return;
       const btn = e.target?.closest?.('button');
       if (btn) {
         btn.blur?.();
