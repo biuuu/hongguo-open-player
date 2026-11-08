@@ -1256,6 +1256,99 @@ test('danmaku engine receives episode comments and is replaced when switching ep
   assert.equal(instances.at(-1).options.comments.length, 1);
 });
 
+test('danmaku merges identical text on the media timeline and refreshes when the interval changes', async () => {
+  const instances = [];
+  const updates = [];
+  class FakeDanmaku {
+    constructor(options) { this.options = options; instances.push(this); }
+    destroy() { this.destroyed = true; }
+    resize() {}
+  }
+  const items = [
+    { time: 30, text: '重复', likes: 100, color: '#ff0000' },
+    { time: 0, text: '重复', likes: 0, color: '#ffffff' },
+    { time: 15, text: '重复', likes: 500, color: '#00ff00' },
+    { time: 29.99, text: '重复', likes: 0 },
+    { time: 31, text: '其他', likes: 0 },
+    { time: 45, text: '重复', likes: 0 },
+    { time: 60, text: '重复', likes: 0 },
+    { time: 60, text: '重复', likes: 0 }
+  ];
+  const state = client(async (url, options) => {
+    if (url === '/api/preferences') { updates.push(JSON.parse(options.body)); return response({}); }
+    if (url.startsWith('/api/danmaku/')) return response({ success: true, items });
+    return response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }] });
+  }, {
+    Danmaku: FakeDanmaku,
+    document: {
+      documentElement: { classList: { add() {} } },
+      createElement() { return { style: {}, appendChild(child) { this.child = child; } }; }
+    }
+  });
+  state.videoEl.value = { pause() {}, play() { return Promise.resolve(); } };
+  state.danmakuLayer.value = { offsetWidth: 800, offsetHeight: 96 };
+  await state.openTheater({ series_id: '123456' });
+  await new Promise(resolve => setImmediate(resolve));
+  const first = instances.at(-1);
+  assert.equal(state.danmakuMergeInterval.value, 30);
+  assert.deepEqual(Array.from(first.options.comments, comment => comment.time), [0, 30, 31, 60]);
+  const rendered = first.options.comments[0].render();
+  assert.equal(rendered.textContent, '重复');
+  assert.equal(rendered.style.color, '#ffffff');
+  assert.equal(rendered.child, undefined);
+  assert.deepEqual(items.map(item => item.time), [30, 0, 15, 29.99, 31, 45, 60, 60]);
+
+  state.setDanmakuMergeInterval(15);
+  assert.equal(first.destroyed, true);
+  assert.deepEqual(Array.from(instances.at(-1).options.comments, comment => comment.time), [0, 15, 30, 31, 45, 60]);
+  state.setDanmakuMergeInterval(0);
+  assert.deepEqual(Array.from(instances.at(-1).options.comments, comment => comment.time), [0, 15, 29.99, 30, 31, 45, 60, 60]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(updates.map(update => update.danmakuMergeInterval), [15, 0]);
+});
+
+test('late danmaku interval preferences rebuild the active engine but do not override a user change', async () => {
+  let finishPreferences;
+  const instances = [];
+  class FakeDanmaku {
+    constructor(options) { this.options = options; instances.push(this); }
+    destroy() { this.destroyed = true; }
+    resize() {}
+  }
+  const state = client((url, options) => {
+    if (url === '/api/preferences' && !options) return new Promise(resolve => { finishPreferences = resolve; });
+    if (url === '/api/preferences') return Promise.resolve(response({}));
+    if (url.startsWith('/api/danmaku/')) return Promise.resolve(response({ success: true, items: [
+      { time: 0, text: '重复', likes: 0 }, { time: 20, text: '重复', likes: 0 }
+    ] }));
+    if (url.startsWith('/api/series/')) return Promise.resolve(response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }] }));
+    return Promise.resolve(response(url === '/api/search-history' ? [] : { results: [] }));
+  }, { Danmaku: FakeDanmaku, document: { documentElement: { classList: { add() {} } }, addEventListener() {}, querySelector() { return null; } } });
+  state.mountForTest();
+  state.videoEl.value = { pause() {}, play() { return Promise.resolve(); } };
+  state.danmakuLayer.value = { offsetWidth: 800, offsetHeight: 96 };
+  await state.openTheater({ series_id: '123456' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(instances.at(-1).options.comments.length, 1);
+  const first = instances.at(-1);
+  finishPreferences(response({ danmakuMergeInterval: 15 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(first.destroyed, true);
+  assert.equal(state.danmakuMergeInterval.value, 15);
+  assert.equal(instances.at(-1).options.comments.length, 2);
+
+  let finishSecondPreferences;
+  const changed = client((url, options) => {
+    if (url === '/api/preferences' && !options) return new Promise(resolve => { finishSecondPreferences = resolve; });
+    return Promise.resolve(response(url === '/api/search-history' ? [] : { results: [] }));
+  }, { document: { documentElement: { classList: { add() {} } }, addEventListener() {}, querySelector() { return null; } } });
+  changed.mountForTest();
+  changed.setDanmakuMergeInterval(60);
+  finishSecondPreferences(response({ danmakuMergeInterval: 15 }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(changed.danmakuMergeInterval.value, 60);
+});
+
 test('search history selection searches again and supports removal', async () => {
   const calls = [];
   let stored = [];

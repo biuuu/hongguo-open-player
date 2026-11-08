@@ -111,7 +111,13 @@ createApp({
     function startDanmakuAnimation() {
       if (danmakuEngine || !danmakuEnabled.value || !videoEl.value || !danmakuLayer.value || typeof Danmaku === 'undefined') return;
       const layer = danmakuLayer.value;
-      const comments = danmakuItems.value.map(item => ({
+      const lastShown = new Map();
+      const comments = [...danmakuItems.value].sort((a, b) => a.time - b.time).filter(item => {
+        const previous = lastShown.get(item.text);
+        if (previous !== undefined && item.time - previous < danmakuMergeInterval.value) return false;
+        lastShown.set(item.text, item.time);
+        return true;
+      }).map(item => ({
         time: item.time,
         render() {
           const text = document.createElement('span');
@@ -156,11 +162,13 @@ createApp({
         const response = await fetch('/api/preferences');
         if (!response.ok) throw new Error('读取失败');
         const prefs = await response.json();
-        const refs = { danmakuEnabled, danmakuRows, danmakuOpacity, volume, isMuted, playbackRate, fitMode };
+        const previousMergeInterval = danmakuMergeInterval.value;
+        const refs = { danmakuEnabled, danmakuRows, danmakuOpacity, danmakuMergeInterval, volume, isMuted, playbackRate, fitMode };
         for (const [key, value] of Object.entries(prefs)) {
           if (refs[key] && !changedPreferences.has(key)) refs[key].value = value;
         }
         if (!danmakuEnabled.value) stopDanmakuAnimation();
+        else if (danmakuMergeInterval.value !== previousMergeInterval) refreshDanmakuEngine();
         if (videoEl.value) {
           videoEl.value.volume = Number(volume.value);
           videoEl.value.muted = isMuted.value;
@@ -170,6 +178,12 @@ createApp({
     }
     const danmakuRows = ref(3);
     const danmakuOpacity = ref(0.8);
+    const danmakuMergeInterval = ref(30);
+    function setDanmakuMergeInterval(seconds) {
+      danmakuMergeInterval.value = seconds;
+      savePreferences({ danmakuMergeInterval: seconds });
+      refreshDanmakuEngine();
+    }
     const danmakuItems = ref([]);
     const danmakuStatus = ref('');
     let danmakuKey = '';
@@ -1576,7 +1590,7 @@ createApp({
     });
 
     return {
-      savePreferences, danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuStatus, danmakuLayer, danmakuColor, toggleDanmaku, loadDanmaku,
+      savePreferences, danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuMergeInterval, setDanmakuMergeInterval, danmakuStatus, danmakuLayer, danmakuColor, toggleDanmaku, loadDanmaku,
       toastText, osdMessage, sidebarOpen, isScrubbing, previewTime, previewPercent, showPreview,
       isFullscreen, isMiniMode, miniModeAvailable, toggleMiniMode, isControlsHidden, playerControlsEl, miniRestoreBtnEl, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove, handleControlsPointerEnter, handleControlsPointerLeave, holdControls, releaseControls,
       previewSeek, seekFromSlider, startScrubbing, finishScrubbing,
