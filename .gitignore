@@ -1,7 +1,10 @@
 node_modules/
 dist/
 dist-electron/
+build/bytevc2/
 data/*.json
+data/*.bak
+*.bak
 .DS_Store
 *.log
 *.apk

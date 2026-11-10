@@ -325,7 +325,7 @@ function clearEntryCache(vid) {
     else entryCache.clear();
 }
 
-async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQuality, deadline, signal) {
+async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQuality, deadline, signal, allowBytevc2 = false) {
     const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
     if (!model) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
     const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
@@ -340,22 +340,29 @@ async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQualit
         info = outer?.video_info?.data;
     }
     if (!info) throw Object.assign(new Error('App 接口未返回本集片源模型'), { code: 'MISSING_MODEL' });
-    const rows = Object.values(info?.video_list || {}).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
+    const candidates = Object.values(info?.video_list || {}).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
         const codec = str(item.codec_type || item.video_meta?.codec_type).toLowerCase();
-        const codecRank = ['h264', 'avc', 'avc1'].includes(codec) ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].includes(codec) ? 1 : 2;
+        const codecRank = ['h264', 'avc', 'avc1'].includes(codec) ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].includes(codec) ? 1 : allowBytevc2 && ['bytevc2', 'bvc2'].includes(codec) ? 2 : 3;
         const quality = str(item.quality_desc || item.definition || item.video_meta?.definition || item.height || item.vheight);
         const meta = item.video_meta || {};
         const [width, height] = [[item.vwidth, item.vheight], [item.width, item.height], [meta.vwidth, meta.vheight], [meta.width, meta.height]]
             .map(pair => pair.map(Number)).find(pair => pair.every(value => Number.isFinite(value) && value > 0)) || [0, 0];
         const pixels = width && height ? Math.min(width, height) : Number(quality.match(/\d+/)?.[0] || 0);
         return { item, codec, codecRank, quality, pixels, width, height };
-    }).filter(row => row.codecRank < 2 && (allowLowerQuality || meetsDownloadQuality(row, requestedQuality))).sort((a, b) => {
+    });
+    const hasCompatibleCodec = candidates.some(row => row.codecRank < 2);
+    const rows = candidates.filter(row => row.codecRank < (hasCompatibleCodec ? 2 : 3)
+        && (allowLowerQuality || meetsDownloadQuality(row, requestedQuality))).sort((a, b) => {
         if (requestedQuality === 'auto') return a.codecRank - b.codecRank || b.pixels - a.pixels;
         const aMeets = meetsDownloadQuality(a, requestedQuality), bMeets = meetsDownloadQuality(b, requestedQuality);
         if (aMeets !== bMeets) return Number(bMeets) - Number(aMeets);
         const aPixels = Math.min(a.width, a.height), bPixels = Math.min(b.width, b.height);
         return (aMeets ? aPixels - bPixels : bPixels - aPixels) || a.codecRank - b.codecRank;
     });
+    if (!allowBytevc2 && !rows.length && candidates.some(row => row.codec === 'bytevc2' || row.codec === 'bvc2')
+        && !candidates.some(row => row.codecRank < 2)) {
+        throw Object.assign(new Error('本集使用 ByteVC2 编码，当前播放器暂不支持'), { code: 'UNSUPPORTED_BYTEVC2' });
+    }
     if (!rows.length) throw new Error(requestedQuality === 'auto' || allowLowerQuality
         ? '本集暂未提供兼容的 H.264/HEVC 片源'
         : `本集暂无尺寸可确认且满足 ${requestedQuality} 的 H.264/HEVC 片源，未降级`);
@@ -371,7 +378,8 @@ async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQualit
     for (const selected of selectedRows) {
         try {
             const spade = selected.item.spade_a || selected.item.encrypt_info?.spade_a;
-            if (inline && !spade && ![false, 0, '0', 'false'].includes(selected.item.encrypt_info?.encrypt)) {
+            if (inline && !spade && selected.item.encrypt_info != null
+                && ![false, 0, '0', 'false'].includes(selected.item.encrypt_info?.encrypt)) {
                 throw Object.assign(new Error('本集片源缺少有效解密信息'), { code: 'INVALID_RESPONSE' });
             }
             const key = spade ? deriveContentKey(spade) : null;
@@ -386,14 +394,14 @@ async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQualit
                     const identity = `${url}:${contentKey || ''}`;
                     if (seen.has(identity)) continue;
                     seen.add(identity);
-                    variants.push({ url, contentKey, codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec, source: 'app', vid,
+                    variants.push({ url, contentKey, codec: selected.codec === 'bytevc1' ? 'hevc' : selected.codec === 'bvc2' ? 'bytevc2' : selected.codec, source: 'app', vid,
                         userAgent: inline ? PLAYBACK_UA : VIDEO_UA, quality: allowLowerQuality ? (selected.width && selected.height ? `${Math.min(selected.width, selected.height)}p` : '') : requestedQuality === 'auto' ? selected.quality : requestedQuality,
                         ...(requestedQuality === 'auto' ? {} : { width: selected.width, height: selected.height }) });
                 } catch (error) { lastError = error; }
             }
         } catch (error) { lastError = error; }
     }
-    if (variants.length) return { ...variants[0], variants };
+    if (variants.length) return { ...variants[0], variants, duration: Number(model.video_duration || info.video_duration) || 0 };
     throw lastError?.code === 'SECURITY_BLOCKED' ? lastError
         : Object.assign(new Error('本集片源地址或密钥无法解析'), { code: 'INVALID_RESPONSE' });
 }
@@ -411,8 +419,9 @@ async function fetchAppPlayUrl(vid, options = {}) {
         const cached = entryCache.get(vid);
         if (cached?.expires > Date.now()) {
             try {
-                return await parseEntryPlayInfo(vid, cached.entry, requestedQuality, allowLowerQuality, deadline, signal);
-            } catch (_) {
+                return await parseEntryPlayInfo(vid, cached.entry, requestedQuality, allowLowerQuality, deadline, signal, options.allowBytevc2 === true);
+            } catch (error) {
+                if (error.code === 'UNSUPPORTED_BYTEVC2') throw error;
                 entryCache.delete(vid);
             }
         } else {
@@ -467,7 +476,7 @@ async function fetchAppPlayUrl(vid, options = {}) {
 
     const currentEntry = response.data?.[vid] || entryCache.get(vid)?.entry;
     if (!currentEntry) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: 'MISSING_MODEL' });
-    return await parseEntryPlayInfo(vid, currentEntry, requestedQuality, allowLowerQuality, deadline, signal);
+    return await parseEntryPlayInfo(vid, currentEntry, requestedQuality, allowLowerQuality, deadline, signal, options.allowBytevc2 === true);
 }
 
 module.exports = { fetchAppPlayUrl, clearEntryCache, signedSearchRequest, signedMetadataRequest, parseSearchInteger, requestJson, SEARCH_API, SEARCH_UA };

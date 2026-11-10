@@ -96,6 +96,15 @@ createApp({
     const previewPercent = ref(0);
     const showPreview = ref(false);
     const showDramaDetailModal = ref(false);
+    const relatedSeasons = ref([]);
+    const isCheckingSeasons = ref(false);
+    const seriesBaseTitle = ref('');
+    const showSeasonsModal = ref(false);
+    const sidebarTab = ref('episodes'); // 'episodes' | 'seasons'
+    const titleCopied = ref(false);
+    let titleCopiedTimer = null;
+    const seasonsCache = new Map();
+    let currentSeasonsRequest = 0;
     const showAppMenu = ref(false);
     const danmakuEnabled = ref(true);
     const showDanmakuSettings = ref(false);
@@ -108,17 +117,168 @@ createApp({
       danmakuEngine?.destroy();
       danmakuEngine = null;
     }
+
+    // 根据文本长度和点赞标识预估弹幕的物理渲染像素宽度
+    function estimateDanmakuWidth(text, likes = 0) {
+      let width = 12; // 基础边距
+      const str = String(text || '');
+      for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i);
+        // ASCII 半角字符约 10px，全角/中文约 20px (对应 font-size: 20px)
+        width += (code >= 0x20 && code <= 0x7e) ? 10 : 20;
+      }
+      if (likes > 0) {
+        const likeStr = '+' + likes;
+        width += 6 + likeStr.length * 8;
+      }
+      return width;
+    }
+
+    // 计算两相邻弹幕在同一轨道上不发生碰撞（间距 >= 8px）所需的最小时间差（秒）
+    function calculateRequiredGap(wPrev, wNext, screenWidth, duration) {
+      const gapPrev = duration * (wPrev + 8) / (screenWidth + wPrev);
+      const gapNext = duration * (wNext + 8) / (screenWidth + wNext);
+      return Math.max(gapPrev, gapNext);
+    }
+
+    // 基于真实物理时空长度与多轨道连续调度的弹幕“高赞优先”优选算法
+    function prioritizeDanmakuItems(items, options = {}) {
+      if (!Array.isArray(items) || !items.length) return [];
+      const likesPriority = options.likesPriority !== false;
+      if (!likesPriority) return [...items];
+
+      const rows = Math.max(1, Number(options.rows) || 3);
+      const screenWidth = Math.max(320, Number(options.screenWidth) || 800);
+      const speedOption = options.speed || 'medium';
+      const speedFactor = { fast: 12, medium: 16, slow: 20 }[speedOption] || 16;
+      const duration = speedFactor;
+
+      // 提取并预估每条弹幕的物理属性
+      const candidates = items.map((item, index) => {
+        const likes = Number.isSafeInteger(item.likes) && item.likes > 0 ? item.likes : 0;
+        const time = Number(item.time) || 0;
+        const width = estimateDanmakuWidth(item.text, likes);
+        return {
+          raw: item,
+          time,
+          likes,
+          width,
+          index
+        };
+      });
+
+      // 严格按时间先后排序；同时间点按点赞数降序优先
+      candidates.sort((a, b) => {
+        if (a.time !== b.time) return a.time - b.time;
+        if (b.likes !== a.likes) return b.likes - a.likes;
+        return a.index - b.index;
+      });
+
+      // 初始化每一条轨道的排期列表
+      const tracks = Array.from({ length: rows }, () => ({ items: [] }));
+
+      for (const c of candidates) {
+        let freeTrackIndex = -1;
+        let minGapToLast = Infinity;
+
+        // 1. 查找是否存在无需发生阻挡冲突即可容纳 c 的空闲轨道
+        for (let k = 0; k < rows; k++) {
+          const trackItems = tracks[k].items;
+          if (trackItems.length === 0) {
+            freeTrackIndex = k;
+            break;
+          }
+          const prev = trackItems[trackItems.length - 1];
+          const reqGap = calculateRequiredGap(prev.width, c.width, screenWidth, duration);
+          if (c.time >= prev.time + reqGap) {
+            const gap = c.time - (prev.time + reqGap);
+            if (gap < minGapToLast) {
+              minGapToLast = gap;
+              freeTrackIndex = k;
+            }
+          }
+        }
+
+        if (freeTrackIndex !== -1) {
+          tracks[freeTrackIndex].items.push(c);
+          continue;
+        }
+
+        // 2. 所有轨道均处于阻挡期（发生同屏碰撞冲突！）
+        // 若当前弹幕拥有更高的点赞数，则淘汰正在阻挡它的低赞/0赞弹幕
+        if (c.likes > 0) {
+          let bestReplaceTrack = -1;
+          let minIncumbentLikes = c.likes; // 必须严格低于 c 的点赞数
+          let maxRemainingBlock = -Infinity;
+
+          for (let k = 0; k < rows; k++) {
+            const trackItems = tracks[k].items;
+            const incumbent = trackItems[trackItems.length - 1];
+            if (incumbent.likes >= c.likes) continue; // 现有弹幕点赞数不低于 c，不能替代
+
+            // 检查剔除现有弹幕后，c 与该轨道倒数第二条弹幕是否无冲突
+            let canReplace = true;
+            if (trackItems.length >= 2) {
+              const prevBefore = trackItems[trackItems.length - 2];
+              const reqGapWithPrev = calculateRequiredGap(prevBefore.width, c.width, screenWidth, duration);
+              if (c.time < prevBefore.time + reqGapWithPrev) {
+                canReplace = false;
+              }
+            }
+
+            if (canReplace) {
+              const reqGap = calculateRequiredGap(incumbent.width, c.width, screenWidth, duration);
+              const remainingBlock = (incumbent.time + reqGap) - c.time;
+
+              // 优选原则：优先淘汰点赞最低的；若同为 0 赞，淘汰阻挡时间最长的
+              if (incumbent.likes < minIncumbentLikes ||
+                  (incumbent.likes === minIncumbentLikes && remainingBlock > maxRemainingBlock)) {
+                minIncumbentLikes = incumbent.likes;
+                maxRemainingBlock = remainingBlock;
+                bestReplaceTrack = k;
+              }
+            }
+          }
+
+          if (bestReplaceTrack !== -1) {
+            // 舍弃并替换该轨道上的低赞/0赞弹幕，让高赞弹幕上屏
+            tracks[bestReplaceTrack].items.pop();
+            tracks[bestReplaceTrack].items.push(c);
+          }
+        }
+      }
+
+      // 收集所有成功上轨的弹幕并恢复严格的时间戳顺序
+      const result = [];
+      for (let k = 0; k < rows; k++) {
+        for (const entry of tracks[k].items) {
+          result.push(entry.raw);
+        }
+      }
+
+      result.sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
+      return result;
+    }
+
     function startDanmakuAnimation() {
       if (danmakuEngine || !danmakuEnabled.value || !videoEl.value || !danmakuLayer.value || typeof Danmaku === 'undefined') return;
       const layer = danmakuLayer.value;
       const lastShown = new Map();
-      const comments = [...danmakuItems.value].sort((a, b) => a.time - b.time).filter(item => {
+      const merged = [...danmakuItems.value].sort((a, b) => a.time - b.time).filter(item => {
         const previous = lastShown.get(item.text);
         if (previous !== undefined && item.time - previous < danmakuMergeInterval.value) return false;
         lastShown.set(item.text, item.time);
         return true;
-      }).map(item => ({
+      });
+      const prioritized = prioritizeDanmakuItems(merged, {
+        rows: danmakuRows.value,
+        speed: danmakuSpeed.value,
+        screenWidth: layer.offsetWidth || 800,
+        likesPriority: danmakuLikesPriority.value
+      });
+      const comments = prioritized.map(item => ({
         time: item.time,
+        likes: Number(item.likes) || 0,
         render() {
           const text = document.createElement('span');
           text.className = 'danmaku-item';
@@ -133,10 +293,10 @@ createApp({
           return text;
         }
       }));
-      danmakuEngine = new Danmaku({ container: layer, media: videoEl.value, comments, speed: Math.max(1, layer.offsetWidth / 10) });
+      danmakuEngine = new Danmaku({ container: layer, media: videoEl.value, comments, speed: danmakuSpeedForWidth(layer.offsetWidth) });
       const resize = () => {
         if (!danmakuEngine || !layer.offsetWidth || !layer.offsetHeight) return;
-        danmakuEngine.speed = layer.offsetWidth / 10;
+        danmakuEngine.speed = danmakuSpeedForWidth(layer.offsetWidth);
         danmakuEngine.resize();
       };
       if (typeof ResizeObserver !== 'undefined') {
@@ -163,7 +323,7 @@ createApp({
         if (!response.ok) throw new Error('读取失败');
         const prefs = await response.json();
         const previousMergeInterval = danmakuMergeInterval.value;
-        const refs = { danmakuEnabled, danmakuRows, danmakuOpacity, danmakuMergeInterval, volume, isMuted, playbackRate, fitMode };
+        const refs = { danmakuEnabled, danmakuRows, danmakuOpacity, danmakuSpeed, danmakuLikesPriority, danmakuMergeInterval, volume, isMuted, playbackRate, fitMode };
         for (const [key, value] of Object.entries(prefs)) {
           if (refs[key] && !changedPreferences.has(key)) refs[key].value = value;
         }
@@ -176,7 +336,20 @@ createApp({
         }
       } catch (_) { /* Keep defaults when stored preferences cannot be read. */ }
     }
+    const danmakuSpeed = ref('medium');
+    function danmakuSpeedForWidth(width) {
+      return Math.max(1, width / ({ fast: 12, medium: 16, slow: 20 }[danmakuSpeed.value] || 16));
+    }
+    watch(danmakuSpeed, () => {
+      if (danmakuEngine && danmakuLayer.value?.offsetWidth) danmakuEngine.speed = danmakuSpeedForWidth(danmakuLayer.value.offsetWidth);
+    });
     const danmakuRows = ref(3);
+    const danmakuLikesPriority = ref(true);
+    function toggleLikesPriority() {
+      danmakuLikesPriority.value = !danmakuLikesPriority.value;
+      savePreferences({ danmakuLikesPriority: danmakuLikesPriority.value });
+      refreshDanmakuEngine();
+    }
     const danmakuOpacity = ref(0.8);
     const danmakuMergeInterval = ref(30);
     function setDanmakuMergeInterval(seconds) {
@@ -225,7 +398,7 @@ createApp({
       if (likes >= 1) return '#a8dcff';
       return '#ffffff';
     }
-    watch([danmakuLayer, videoEl], refreshDanmakuEngine, { flush: 'post' });
+    watch([danmakuLayer, videoEl, danmakuRows, danmakuSpeed, danmakuLikesPriority], refreshDanmakuEngine, { flush: 'post' });
     const showAboutModal = ref(false);
     const appVersion = ref('');
     const showShortcutsModal = ref(false);
@@ -463,6 +636,9 @@ createApp({
     // 当前选集分组
     const currentGroup = ref({ start: 1, end: 30 });
     const streamRefreshTick = ref(0);
+    let bytevc2Session = null;
+    let bytevc2Fallback = null;
+    let bytevc2FallbackActive = false;
 
     // 当前播放直链 (通过本地边下边解代理)
     const currentStreamUrl = computed(() => {
@@ -474,6 +650,7 @@ createApp({
       const nextEp3 = activeEpisodes.value.find(e => e.vid_index === activeEpisodeIndex.value + 3);
       const nextList = [nextEp1?.vid, nextEp2?.vid, nextEp3?.vid].filter(Boolean);
       const params = [];
+      if (window.Bytevc2Stream?.supported()) params.push('mse=1');
       if (nextEp1?.vid) params.push(`next_vid=${encodeURIComponent(nextEp1.vid)}`);
       if (nextList.length > 1) params.push(`next_vids=${encodeURIComponent(nextList.join(','))}`);
       if (streamRefreshTick.value > 0) params.push(`refresh=${streamRefreshTick.value}`);
@@ -969,9 +1146,253 @@ createApp({
       e.target.src = '/assets/app-icon.png';
     }
 
+    async function copyToClipboard(text, successMsg) {
+      if (!text) return false;
+      try {
+        if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(text);
+        } else if (typeof document !== 'undefined' && typeof document.createElement === 'function' && document.body) {
+          const el = document.createElement('textarea');
+          el.value = text;
+          el.style.position = 'fixed';
+          el.style.opacity = '0';
+          document.body.appendChild(el);
+          el.select();
+          if (typeof document.execCommand === 'function') {
+            document.execCommand('copy');
+          }
+          document.body.removeChild(el);
+        }
+        notify(successMsg || '已复制到剪贴板');
+        return true;
+      } catch (err) {
+        console.warn('复制失败:', err);
+        notify('复制失败，请手动选中文本复制');
+        return false;
+      }
+    }
+
+    async function copyDramaTitle() {
+      const title = activeSeries.value?.series_title || '';
+      if (!title) return;
+      const ok = await copyToClipboard(title, `已复制剧名: 《${title}》`);
+      if (ok) {
+        titleCopied.value = true;
+        clearTimeout(titleCopiedTimer);
+        titleCopiedTimer = setTimeout(() => { titleCopied.value = false; }, 2000);
+      }
+    }
+
+    const CHINESE_NUMS = {
+      '零': 0, '一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
+      '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10
+    };
+
+    function parseChineseNumber(str) {
+      if (!str) return null;
+      str = String(str).trim();
+      if (/^\d+$/.test(str)) return parseInt(str, 10);
+      if (str.length === 1 && CHINESE_NUMS[str] !== undefined) return CHINESE_NUMS[str];
+      if (str === '十') return 10;
+      if (str.length === 2) {
+        if (str[0] === '十' && CHINESE_NUMS[str[1]] !== undefined) return 10 + CHINESE_NUMS[str[1]];
+        if (CHINESE_NUMS[str[0]] !== undefined && str[1] === '十') return CHINESE_NUMS[str[0]] * 10;
+      }
+      if (str.length === 3 && CHINESE_NUMS[str[0]] !== undefined && str[1] === '十' && CHINESE_NUMS[str[2]] !== undefined) {
+        return CHINESE_NUMS[str[0]] * 10 + CHINESE_NUMS[str[2]];
+      }
+      return null;
+    }
+
+    const SEASON_PATTERNS = [
+      /[（(【\s]*第\s*([0-9零一二两三四五六七八九十]+)\s*(?:季|部|期|辑)[）)】\s]*$/i,
+      /[（(【\s]*([0-9零一二两三四五六七八九十]+)\s*(?:季|部|期|辑)[）)】\s]*$/i,
+      /[（(【\s]*(?:Season|S)\s*([0-9]+)[）)】\s]*$/i,
+      /[（(【]\s*([0-9]+)\s*[）)】]$/i
+    ];
+
+    function parseSeasonInfo(rawTitle) {
+      if (!rawTitle || typeof rawTitle !== 'string') {
+        return { baseTitle: '', seasonNum: 1, seasonLabel: '第1季', isExplicit: false };
+      }
+      const title = rawTitle.trim();
+      for (const pattern of SEASON_PATTERNS) {
+        const match = title.match(pattern);
+        if (match) {
+          const num = parseChineseNumber(match[1]);
+          if (num && num > 0 && num <= 100) {
+            const rawBase = title.slice(0, match.index).trim();
+            const baseTitle = rawBase.replace(/[\s:：·_—\-]+$/, '').trim() || rawBase;
+            if (baseTitle) {
+              return { baseTitle, seasonNum: num, seasonLabel: `第${num}季`, isExplicit: true };
+            }
+          }
+        }
+      }
+      const cleaned = title.replace(/[\s:：·_—\-]+$/, '').trim() || title;
+      return { baseTitle: cleaned, seasonNum: 1, seasonLabel: '第1季', isExplicit: false };
+    }
+
+    function normalizeBaseTitle(title) {
+      return (title || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[：:]/g, ':')
+        .replace(/[，,]/g, ',')
+        .replace(/[！!]/g, '!')
+        .replace(/[？?]/g, '')
+        .replace(/[“”"']/g, '')
+        .replace(/\s+/g, '');
+    }
+
+    async function fetchRelatedSeasons(series) {
+      if (!series || !series.series_title) {
+        relatedSeasons.value = [];
+        seriesBaseTitle.value = '';
+        return;
+      }
+      const requestId = ++currentSeasonsRequest;
+      const { baseTitle, seasonNum, seasonLabel, isExplicit } = parseSeasonInfo(series.series_title);
+      seriesBaseTitle.value = baseTitle;
+
+      const currentItem = {
+        series_id: series.series_id,
+        series_title: series.series_title,
+        cover: series.cover,
+        total: series.episodes?.length || series.total,
+        social_info: series.social_info,
+        tags: series.tags,
+        seasonNum,
+        seasonLabel,
+        isExplicit
+      };
+
+      const cached = seasonsCache.get(baseTitle);
+      if (cached && Array.isArray(cached) && cached.length > 0) {
+        relatedSeasons.value = cached;
+        return;
+      }
+
+      isCheckingSeasons.value = true;
+      try {
+        const res1 = await fetch(`/api/search?keyword=${encodeURIComponent(baseTitle)}&page=1`).then(r => r.json());
+        if (requestId !== currentSeasonsRequest) return;
+        let list = Array.isArray(res1?.results) ? [...res1.results] : [];
+
+        if (res1?.hasMore && list.length >= 5) {
+          try {
+            const res2 = await fetch(`/api/search?keyword=${encodeURIComponent(baseTitle)}&page=2`).then(r => r.json());
+            if (requestId === currentSeasonsRequest && Array.isArray(res2?.results)) {
+              list = list.concat(res2.results);
+            }
+          } catch (_) {}
+        }
+        if (requestId !== currentSeasonsRequest) return;
+
+        const normBase = normalizeBaseTitle(baseTitle);
+        const seenIds = new Set();
+        const result = [];
+
+        seenIds.add(currentItem.series_id);
+        result.push(currentItem);
+
+        for (const item of list) {
+          if (!item || !item.series_id || seenIds.has(item.series_id)) continue;
+          const parsed = parseSeasonInfo(item.series_title);
+          const itemNormBase = normalizeBaseTitle(parsed.baseTitle);
+
+          if (itemNormBase === normBase || (normBase.length >= 4 && itemNormBase.includes(normBase))) {
+            seenIds.add(item.series_id);
+            result.push({
+              series_id: item.series_id,
+              series_title: item.series_title,
+              cover: item.cover,
+              total: item.total,
+              social_info: item.social_info,
+              tags: item.tags,
+              seasonNum: parsed.seasonNum,
+              seasonLabel: parsed.seasonLabel,
+              isExplicit: parsed.isExplicit
+            });
+          }
+        }
+
+        // 必须严格按季升序排好序: 1, 2, 3, ..., N
+        result.sort((a, b) => {
+          if (a.seasonNum !== b.seasonNum) return a.seasonNum - b.seasonNum;
+          if (a.isExplicit && !b.isExplicit) return -1;
+          if (!a.isExplicit && b.isExplicit) return 1;
+          return (b.total || 0) - (a.total || 0);
+        });
+
+        seasonsCache.set(baseTitle, result);
+        relatedSeasons.value = result;
+      } catch (err) {
+        if (requestId !== currentSeasonsRequest) return;
+        console.warn('获取系列各季失败:', err);
+        relatedSeasons.value = [currentItem];
+      } finally {
+        if (requestId === currentSeasonsRequest) {
+          isCheckingSeasons.value = false;
+        }
+      }
+    }
+
+    function selectSeason(season) {
+      if (!season || !season.series_id) return;
+      if (season.series_id === activeSeries.value?.series_id) {
+        closeSeasonsModal();
+        return;
+      }
+      closeSeasonsModal();
+      closeDramaDetail();
+      sidebarTab.value = 'episodes';
+      return openTheater(season);
+    }
+
+    function openSeasonsModal() {
+      showSeasonsModal.value = true;
+      if (typeof nextTick === 'function') {
+        nextTick(() => {
+          const modal = document?.querySelector?.('.seasons-modal');
+          modal?.focus?.();
+        });
+      }
+    }
+
+    function closeSeasonsModal() {
+      showSeasonsModal.value = false;
+      keepPlayerFocus();
+    }
+
+    function onSeasonsModalKeydown(e) {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        e.preventDefault();
+        closeSeasonsModal();
+      }
+    }
+
+    function searchSeriesGlobally(keyword) {
+      closeSeasonsModal();
+      closeDramaDetail();
+      leaveTheater();
+      searchKeyword.value = keyword || seriesBaseTitle.value;
+      handleSearch();
+    }
+
+    function openSeasonsModalFromDetail() {
+      closeDramaDetail();
+      openSeasonsModal();
+    }
+
     // ================= 沉浸式剧场与播放逻辑 =================
 
     function resetPlayback() {
+      bytevc2Session?.stop();
+      bytevc2Session = null;
+      bytevc2Fallback = null;
+      bytevc2FallbackActive = false;
       lastNearEndPrefetch = 0;
       stopDanmakuAnimation();
       progressReady = false;
@@ -991,6 +1412,8 @@ createApp({
       setControlsHidden(false);
       clearTimeout(controlsHideTimer);
       showDramaDetailModal.value = false;
+      showSeasonsModal.value = false;
+      sidebarTab.value = 'episodes';
       viewMode.value = 'catalog';
       if (navigator.mediaSession) { navigator.mediaSession.playbackState = 'none'; navigator.mediaSession.metadata = null; }
     }
@@ -1018,6 +1441,7 @@ createApp({
           detail.tags = drama.tags;
         }
         activeSeries.value = detail;
+        fetchRelatedSeasons(detail);
         const watched = detail.saved_progress?.watched_indexes || [detail.saved_progress?.episode_index];
         watchedMap.value.set(detail.series_id, new Set(watched.filter(index => Number.isInteger(index) && index > 0)));
         activeEpisodes.value = detail.episodes;
@@ -1309,12 +1733,17 @@ createApp({
     }
 
     async function onVideoError(e) {
-      console.error('[Player] 视频播放器报错:', e);
       isBuffering.value = false;
       if (e?.target && e.target !== videoEl.value) return;
+      if (bytevc2Session && bytevc2Fallback) { bytevc2Fallback(); return; }
       const code = videoEl.value?.error?.code;
       const message = videoEl.value?.error?.message || '';
-      reportClientLog('ERROR', `播放器解码/渲染报错: code=${code}, message=${message}`);
+      if (bytevc2FallbackActive) {
+        reportClientLog('ERROR', `ByteVC2 完整转换播放失败: code=${code}, message=${message}`);
+        videoErrorMessage.value = 'ByteVC2 视频转换或播放失败，请重试本集';
+        return;
+      }
+      if (code !== 4) reportClientLog('ERROR', `播放器解码/渲染报错: code=${code}, message=${message}`);
       if (code === 3) {
         videoErrorMessage.value = '视频解码失败；请重试或更换分集，Windows 用户请确认已安装 HEVC 视频扩展';
       } else if (code === 4) {
@@ -1329,14 +1758,45 @@ createApp({
             });
             if (!probeRes.ok && activeEpisodeIndex.value === currentEpIndex) {
               const errData = await probeRes.json().catch(() => null);
-              if (errData?.code === 'DEVICE_REGISTRATION_FAILED' || /匿名播放设备注册失败|ERR_NETWORK/i.test(errData?.error || '')) {
+              if (activeEpisodeIndex.value !== currentEpIndex || currentStreamUrl.value !== streamUrl) return;
+              if (errData?.code !== 'BYTEVC2_PROGRESSIVE') reportClientLog('ERROR', `播放器解码/渲染报错: code=${code}, message=${message}`);
+              if (errData?.code === 'BYTEVC2_PROGRESSIVE' && window.Bytevc2Stream?.supported() && Number(errData.duration) > 0) {
+                videoErrorMessage.value = '';
+                isBuffering.value = true;
+                const video = videoEl.value;
+                const progressiveUrl = streamUrl.replace(/([?&])mse=1(?=&|$)/, '$1mse=stream');
+                bytevc2Session?.stop();
+                bytevc2Fallback = () => {
+                  if (video !== videoEl.value || currentStreamUrl.value !== streamUrl) return;
+                  reportClientLog('WARN', 'ByteVC2 分片播放失败，回退至完整转换');
+                  const position = video.currentTime || 0;
+                  pendingResumeSec = position;
+                  bytevc2Session?.stop();
+                  bytevc2Session = null;
+                  bytevc2Fallback = null;
+                  bytevc2FallbackActive = true;
+                  video.src = streamUrl.replace(/([?&])mse=1(?=&|$)/, '$1mse=buffered');
+                  video.load();
+                  video.play().catch(() => {});
+                };
+                try {
+                  bytevc2Session = window.Bytevc2Stream.start(video, progressiveUrl, Number(errData.duration), bytevc2Fallback);
+                } catch (_) { bytevc2Fallback(); return; }
+                video.play().catch(() => {});
+              } else if (errData?.code === 'DEVICE_REGISTRATION_FAILED' || /匿名播放设备注册失败|ERR_NETWORK/i.test(errData?.error || '')) {
                 videoErrorMessage.value = '播放设备注册受阻（ERR_NETWORK）；请检查网络连接、代理软件（Clash/去广告规则）或 DNS 设置';
                 reportClientLog('WARN', '播放器源探测提示: 设备注册受阻（ERR_NETWORK），已展示网络/代理排查指引');
               } else if (errData?.code === 'SECURITY_BLOCKED') {
                 videoErrorMessage.value = '视频源地址未通过安全检查；请切换分集重试';
+              } else if (errData?.code === 'UNSUPPORTED_BYTEVC2') {
+                videoErrorMessage.value = '本集使用 ByteVC2 编码，当前播放器暂不支持';
+              } else if (errData?.code === 'BYTEVC2_TRANSCODER_UNAVAILABLE' || errData?.code === 'BYTEVC2_TRANSCODE_FAILED') {
+                videoErrorMessage.value = errData.error || 'ByteVC2 视频转换失败，请重试';
               } else if (errData?.error) {
                 videoErrorMessage.value = `${errData.error}；请检查网络或重试切换分集`;
               }
+            } else if (probeRes.ok && activeEpisodeIndex.value === currentEpIndex) {
+              reportClientLog('ERROR', `播放器解码/渲染报错: code=${code}, message=${message}`);
             }
           } catch (_) {
             if (activeEpisodeIndex.value === currentEpIndex && typeof navigator !== 'undefined' && navigator.onLine === false) {
@@ -1352,6 +1812,10 @@ createApp({
     }
 
     function retryCurrentEpisode() {
+      bytevc2Session?.stop();
+      bytevc2Session = null;
+      bytevc2Fallback = null;
+      bytevc2FallbackActive = false;
       videoErrorMessage.value = '';
       streamRefreshTick.value++;
       if (videoEl.value) {
@@ -1451,6 +1915,11 @@ createApp({
         if (showDramaDetailModal.value) {
           e.preventDefault();
           closeDramaDetail();
+          return;
+        }
+        if (showSeasonsModal.value) {
+          e.preventDefault();
+          closeSeasonsModal();
           return;
         }
         if (activeActor.value) {
@@ -1571,6 +2040,7 @@ createApp({
     });
 
     onUnmounted(() => {
+      bytevc2Session?.stop();
       stopDanmakuAnimation();
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('click', handleGlobalClick);
@@ -1590,7 +2060,7 @@ createApp({
     });
 
     return {
-      savePreferences, danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuMergeInterval, setDanmakuMergeInterval, danmakuStatus, danmakuLayer, danmakuColor, toggleDanmaku, loadDanmaku,
+      savePreferences, danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuSpeed, danmakuLikesPriority, danmakuMergeInterval, setDanmakuMergeInterval, toggleLikesPriority, prioritizeDanmakuItems, estimateDanmakuWidth, calculateRequiredGap, danmakuStatus, danmakuLayer, danmakuColor, toggleDanmaku, loadDanmaku,
       toastText, osdMessage, sidebarOpen, isScrubbing, previewTime, previewPercent, showPreview,
       isFullscreen, isMiniMode, miniModeAvailable, toggleMiniMode, isControlsHidden, playerControlsEl, miniRestoreBtnEl, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove, handleControlsPointerEnter, handleControlsPointerLeave, holdControls, releaseControls,
       previewSeek, seekFromSlider, startScrubbing, finishScrubbing,
@@ -1687,6 +2157,21 @@ createApp({
       closeDramaDetail,
       openActorFromDrama,
       onDramaModalKeydown,
+      relatedSeasons,
+      isCheckingSeasons,
+      seriesBaseTitle,
+      showSeasonsModal,
+      sidebarTab,
+      titleCopied,
+      copyDramaTitle,
+      openSeasonsModal,
+      closeSeasonsModal,
+      onSeasonsModalKeydown,
+      selectSeason,
+      searchSeriesGlobally,
+      openSeasonsModalFromDetail,
+      parseSeasonInfo,
+      fetchRelatedSeasons,
       showAppMenu,
       showAboutModal, appVersion,
       showShortcutsModal,

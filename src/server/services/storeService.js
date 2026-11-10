@@ -124,9 +124,11 @@ class StoreService {
     const valid = {};
     if (!value || typeof value !== 'object' || Array.isArray(value)) return valid;
     if (typeof value.danmakuEnabled === 'boolean') valid.danmakuEnabled = value.danmakuEnabled;
+    if (['fast', 'medium', 'slow'].includes(value.danmakuSpeed)) valid.danmakuSpeed = value.danmakuSpeed;
     if ([1, 3, 5].includes(value.danmakuRows)) valid.danmakuRows = value.danmakuRows;
     if (typeof value.danmakuOpacity === 'number' && Number.isFinite(value.danmakuOpacity) && value.danmakuOpacity >= 0.1 && value.danmakuOpacity <= 1) valid.danmakuOpacity = value.danmakuOpacity;
     if (Number.isInteger(value.danmakuMergeInterval) && value.danmakuMergeInterval >= 0 && value.danmakuMergeInterval <= 120 && value.danmakuMergeInterval % 5 === 0) valid.danmakuMergeInterval = value.danmakuMergeInterval;
+    if (typeof value.danmakuLikesPriority === 'boolean') valid.danmakuLikesPriority = value.danmakuLikesPriority;
     if (typeof value.volume === 'number' && Number.isFinite(value.volume) && value.volume >= 0 && value.volume <= 1) valid.volume = value.volume;
     if (typeof value.isMuted === 'boolean') valid.isMuted = value.isMuted;
     if (['0.75', '1.0', '1.25', '1.5', '2.0'].includes(value.playbackRate)) valid.playbackRate = value.playbackRate;

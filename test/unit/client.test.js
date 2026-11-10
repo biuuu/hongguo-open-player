@@ -1171,6 +1171,66 @@ test('onVideoError probes stream endpoint on code 4 and displays device registra
   assert.match(state.videoErrorMessage.value, /Clash\/去广告规则/);
 });
 
+test('onVideoError displays an unsupported ByteVC2 message', async () => {
+  const state = client(async url => url.startsWith('/api/stream/')
+    ? { ok: false, json: async () => ({ code: 'UNSUPPORTED_BYTEVC2' }) }
+    : response({}));
+  state.activeSeries.value = { series_id: '1', series_title: '测试短剧' };
+  state.activeEpisodes.value = [{ vid: '123', vid_index: 1 }];
+  state.activeEpisodeIndex.value = 1;
+  state.videoEl.value = { error: { code: 4, message: 'Format error' } };
+  await state.onVideoError();
+  assert.equal(state.videoErrorMessage.value, '本集使用 ByteVC2 编码，当前播放器暂不支持');
+});
+
+test('ByteVC2 progressive playback starts on detection and stops on switching episodes', async () => {
+  let started, stopped = 0;
+  const state = client(async url => url.startsWith('/api/stream/')
+    ? { ok: false, json: async () => ({ code: 'BYTEVC2_PROGRESSIVE', duration: 46 }) }
+    : response({}), {
+    window: { addEventListener() {}, removeEventListener() {}, Bytevc2Stream: {
+      supported: () => true,
+      start(video, url, duration) { started = { video, url, duration }; return { stop() { stopped++; } }; }
+    } }
+  });
+  state.activeSeries.value = { series_id: '1', series_title: '测试短剧' };
+  state.activeEpisodes.value = [{ vid: '123', vid_index: 1 }, { vid: '456', vid_index: 2 }];
+  state.activeEpisodeIndex.value = 1;
+  state.videoEl.value = { error: { code: 4 }, play: async () => {}, pause() {} };
+  await state.onVideoError();
+  assert.match(started.url, /mse=stream/);
+  assert.equal(started.duration, 46);
+  state.switchEpisode({ vid_index: 2 });
+  assert.equal(stopped, 1);
+});
+
+test('progressive playback failure falls back to buffered conversion', async () => {
+  let fail;
+  const state = client(async url => url.startsWith('/api/stream/')
+    ? { ok: false, json: async () => ({ code: 'BYTEVC2_PROGRESSIVE', duration: 46 }) }
+    : response({}), {
+    window: { addEventListener() {}, removeEventListener() {}, Bytevc2Stream: {
+      supported: () => true,
+      start(_video, _url, _duration, onError) { fail = onError; return { stop() {} }; }
+    } }
+  });
+  state.activeSeries.value = { series_id: '1', series_title: '测试短剧' };
+  state.activeEpisodes.value = [{ vid: '123', vid_index: 1 }];
+  state.activeEpisodeIndex.value = 1;
+  let loaded = 0;
+  state.videoEl.value = { error: { code: 4 }, currentTime: 12, load() { loaded++; }, play: async () => {} };
+  await state.onVideoError();
+  fail(new Error('failed'));
+  assert.match(state.videoEl.value.src, /mse=buffered/);
+  assert.equal(loaded, 1);
+  state.videoEl.value.duration = 46;
+  state.onLoadedMetadata();
+  assert.equal(state.videoEl.value.currentTime, 12);
+  await state.onVideoError();
+  assert.match(state.videoErrorMessage.value, /ByteVC2 视频转换或播放失败/);
+  assert.equal(loaded, 1, 'a failed fallback must not restart progressive playback');
+});
+
 test('onVideoError displays custom stream error when probe reports other server error, and handles code 3', async () => {
   const state = client(async (url) => {
     if (url.startsWith('/api/stream/')) {
@@ -1212,6 +1272,7 @@ test('enabled danmaku loads for each episode and retains display settings', asyn
   await state.openTheater({ series_id: '123456' });
   assert.equal(state.danmakuEnabled.value, true);
   assert.equal(state.danmakuRows.value, 3);
+  assert.equal(state.danmakuSpeed.value, 'medium');
   state.danmakuRows.value = 5;
   state.danmakuOpacity.value = 0.4;
   state.switchEpisode({ vid_index: 2 });
@@ -1231,6 +1292,80 @@ test('danmaku heat colors use fixed like thresholds', async () => {
   assert.equal(new Set([10, 100, 500].map(likes => state.danmakuColor({ likes }))).size, 3);
 });
 
+test('danmaku prioritize items accounts for physical length and duration, prioritizing high-likes over blockers', () => {
+  const state = client(async () => response([]));
+  const { prioritizeDanmakuItems, estimateDanmakuWidth, calculateRequiredGap } = state;
+
+  // 1. 物理长度计算：长文本所需的阻挡时间明显长于短文本
+  const shortWidth = estimateDanmakuWidth('短');
+  const longWidth = estimateDanmakuWidth('这是一条非常非常长的大段文字用来阻挡屏幕');
+  assert.ok(longWidth > shortWidth);
+
+  const shortGap = calculateRequiredGap(shortWidth, shortWidth, 800, 16);
+  const longGap = calculateRequiredGap(longWidth, longWidth, 800, 16);
+  assert.ok(shortGap < 1.5, `shortGap should be ~1s, got ${shortGap}`);
+  assert.ok(longGap > 3.0, `longGap should be >3s, got ${longGap}`);
+
+  // 2. 跨秒时空阻挡测试：
+  // 1条长弹幕在 10.0s 进入，因为文本长，需要阻挡该轨道约 3.5s（直到 13.5s 才能容纳新弹幕）。
+  // 即使高赞弹幕在 12.0s（不同秒！）才进入，长弹幕的物理长度仍然阻挡了它；
+  // 开启高赞优先时，应舍弃 0 赞的长弹幕，保留 12.0s 的高赞弹幕上屏。
+  const crossSecondBlock = [
+    { time: 10.0, text: '这是一条非常非常长的大段文字用来阻挡屏幕整个轨道三四秒之久', likes: 0 },
+    { time: 12.0, text: '高赞核心弹幕', likes: 888 }
+  ];
+  // 只有 1 行轨道时
+  const res1 = prioritizeDanmakuItems(crossSecondBlock, { rows: 1, likesPriority: true });
+  assert.equal(res1.length, 1);
+  assert.equal(res1[0].text, '高赞核心弹幕');
+  assert.equal(res1[0].time, 12.0);
+
+  // 3. 多轨道并发与冲突淘汰测试：
+  // 3 条轨道在 10.0s、10.4s、10.8s 分别被 3 条 0 赞长弹幕占满；
+  // 随后的 12.0s、12.5s、13.0s 来了 3 条高赞弹幕（点赞分别为 900, 600, 300）；
+  // 3 条高赞弹幕均应成功替换 0 赞阻挡弹幕并上屏！
+  const multiTrackDense = [
+    { time: 10.0, text: '低赞长弹幕一号阻挡', likes: 0 },
+    { time: 10.4, text: '低赞长弹幕二号阻挡', likes: 0 },
+    { time: 10.8, text: '低赞长弹幕三号阻挡', likes: 0 },
+    { time: 12.0, text: '热评第一', likes: 900 },
+    { time: 12.5, text: '热评第二', likes: 600 },
+    { time: 13.0, text: '热评第三', likes: 300 }
+  ];
+  const res3 = prioritizeDanmakuItems(multiTrackDense, { rows: 3, likesPriority: true });
+  assert.equal(res3.length, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(res3.map(x => x.text))), ['热评第一', '热评第二', '热评第三']);
+
+  // 4. 无冲突时：多条弹幕（即使 0 赞）完全保留
+  const spacedOut = [
+    { time: 0.0, text: '短一', likes: 0 },
+    { time: 5.0, text: '短二', likes: 0 },
+    { time: 10.0, text: '短三', likes: 0 }
+  ];
+  const resSpaced = prioritizeDanmakuItems(spacedOut, { rows: 1, likesPriority: true });
+  assert.equal(resSpaced.length, 3);
+
+  // 5. 关闭高赞优先开关时：保留全量原始弹幕
+  const disabled = prioritizeDanmakuItems(crossSecondBlock, { rows: 1, likesPriority: false });
+  assert.equal(disabled.length, 2);
+});
+
+test('danmaku likes priority toggle updates preference and state', async () => {
+  const preferencesSaved = [];
+  const state = client(async (url, options) => {
+    if (url === '/api/preferences' && options?.method === 'POST') {
+      preferencesSaved.push(JSON.parse(options.body));
+      return response({});
+    }
+    return response({});
+  });
+  assert.equal(state.danmakuLikesPriority.value, true);
+  state.toggleLikesPriority();
+  assert.equal(state.danmakuLikesPriority.value, false);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(preferencesSaved.at(-1), { danmakuLikesPriority: false });
+});
+
 test('danmaku engine receives episode comments and is replaced when switching episodes', async () => {
   const instances = [];
   class FakeDanmaku {
@@ -1248,7 +1383,7 @@ test('danmaku engine receives episode comments and is replaced when switching ep
   await new Promise(resolve => setImmediate(resolve));
   const first = instances.at(-1);
   assert.equal(first.options.comments[0].time, 2);
-  assert.equal(first.options.speed, 80);
+  assert.equal(first.options.speed, 50);
   state.switchEpisode({ vid_index: 2 });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(first.destroyed, true);
@@ -1285,6 +1420,7 @@ test('danmaku merges identical text on the media timeline and refreshes when the
       createElement() { return { style: {}, appendChild(child) { this.child = child; } }; }
     }
   });
+  state.danmakuLikesPriority.value = false;
   state.videoEl.value = { pause() {}, play() { return Promise.resolve(); } };
   state.danmakuLayer.value = { offsetWidth: 800, offsetHeight: 96 };
   await state.openTheater({ series_id: '123456' });
@@ -1305,6 +1441,29 @@ test('danmaku merges identical text on the media timeline and refreshes when the
   assert.deepEqual(Array.from(instances.at(-1).options.comments, comment => comment.time), [0, 15, 29.99, 30, 31, 45, 60, 60]);
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(updates.map(update => update.danmakuMergeInterval), [15, 0]);
+});
+
+test('danmaku merges duplicates before applying likes priority', async () => {
+  const instances = [];
+  class FakeDanmaku {
+    constructor(options) { this.options = options; instances.push(this); }
+    destroy() {}
+    resize() {}
+  }
+  const state = client(async url => url.startsWith('/api/danmaku/')
+    ? response({ success: true, items: [
+      { time: 0, text: '重复', likes: 0 },
+      { time: 0.1, text: '重复', likes: 999 },
+      { time: 0.2, text: '其他', likes: 10 }
+    ] })
+    : response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }] }),
+  { Danmaku: FakeDanmaku });
+  state.danmakuRows.value = 1;
+  state.videoEl.value = { pause() {}, play() { return Promise.resolve(); } };
+  state.danmakuLayer.value = { offsetWidth: 800, offsetHeight: 96 };
+  await state.openTheater({ series_id: '123456' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(Array.from(instances.at(-1).options.comments, comment => comment.time), [0.2]);
 });
 
 test('late danmaku interval preferences rebuild the active engine but do not override a user change', async () => {
@@ -1518,4 +1677,188 @@ test('video error handler provides specific guidance for MediaError code 2 strea
   };
   state.onVideoError();
   assert.equal(state.videoErrorMessage.value, '视频流读取中断（网络或取流异常）；请点击“重试本集”或切换分集');
+});
+
+test('parseSeasonInfo correctly parses Chinese, Arabic numbers, suffixes and brackets', () => {
+  const state = client(async () => response({}));
+  const p1 = state.parseSeasonInfo('万妖图录传第一季');
+  assert.equal(p1.baseTitle, '万妖图录传');
+  assert.equal(p1.seasonNum, 1);
+  assert.equal(p1.seasonLabel, '第1季');
+  assert.equal(p1.isExplicit, true);
+
+  const p14 = state.parseSeasonInfo('万妖图录传第十四季');
+  assert.equal(p14.baseTitle, '万妖图录传');
+  assert.equal(p14.seasonNum, 14);
+  assert.equal(p14.seasonLabel, '第14季');
+
+  const p2 = state.parseSeasonInfo('全球死考：刚下刑场你让我去考试二季');
+  assert.equal(p2.baseTitle, '全球死考：刚下刑场你让我去考试');
+  assert.equal(p2.seasonNum, 2);
+
+  const p3 = state.parseSeasonInfo('持械入宋 第3部');
+  assert.equal(p3.baseTitle, '持械入宋');
+  assert.equal(p3.seasonNum, 3);
+
+  const pPlain = state.parseSeasonInfo('万妖图录传');
+  assert.equal(pPlain.baseTitle, '万妖图录传');
+  assert.equal(pPlain.seasonNum, 1);
+  assert.equal(pPlain.isExplicit, false);
+
+  const pSeason = state.parseSeasonInfo('大唐荣耀 (Season 5)');
+  assert.equal(pSeason.baseTitle, '大唐荣耀');
+  assert.equal(pSeason.seasonNum, 5);
+
+  const pColon = state.parseSeasonInfo('持械入宋：第四季');
+  assert.equal(pColon.baseTitle, '持械入宋');
+  assert.equal(pColon.seasonNum, 4);
+
+  const pAsciiColon = state.parseSeasonInfo('持械入宋: 第四季');
+  assert.equal(pAsciiColon.baseTitle, '持械入宋');
+  assert.equal(pAsciiColon.seasonNum, 4);
+});
+
+test('fetchRelatedSeasons retrieves all seasons, deduplicates and sorts ascending 1 to N', async () => {
+  const searchResultsPage1 = [
+    { series_id: '10', series_title: '万妖图录传第十季', total: 80 },
+    { series_id: '1', series_title: '万妖图录传第一季', total: 80 },
+    { series_id: '14', series_title: '万妖图录传第十四季', total: 80 },
+    { series_id: '2', series_title: '万妖图录传第二季', total: 80 },
+    { series_id: '3', series_title: '万妖图录传第三季', total: 80 },
+    { series_id: '4', series_title: '万妖图录传第四季', total: 80 },
+    { series_id: '5', series_title: '万妖图录传第五季', total: 80 },
+    { series_id: '6', series_title: '万妖图录传第六季', total: 80 },
+    { series_id: '7', series_title: '万妖图录传第七季', total: 80 },
+    { series_id: '8', series_title: '万妖图录传第八季', total: 80 }
+  ];
+  const searchResultsPage2 = [
+    { series_id: '8', series_title: '万妖图录传第八季', total: 80 }, // Duplicate from upstream
+    { series_id: '9', series_title: '万妖图录传第九季', total: 80 },
+    { series_id: '11', series_title: '万妖图录传第十一季', total: 80 },
+    { series_id: '12', series_title: '万妖图录传第十二季', total: 80 },
+    { series_id: '13', series_title: '万妖图录传第十三季', total: 80 },
+    { series_id: '999', series_title: '无关的短剧', total: 50 } // Should be filtered out
+  ];
+
+  const state = client(async (url) => {
+    if (url.includes('page=1')) return response({ results: searchResultsPage1, hasMore: true });
+    if (url.includes('page=2')) return response({ results: searchResultsPage2, hasMore: false });
+    if (url.startsWith('/api/series/')) {
+      const id = url.split('/').pop();
+      return response({
+        series_id: id,
+        series_title: '万妖图录传第' + id + '季',
+        episodes: [{ vid: id + '_1', vid_index: 1 }]
+      });
+    }
+    return response({});
+  });
+
+  await state.openTheater({ series_id: '1', series_title: '万妖图录传第一季' });
+  await state.fetchRelatedSeasons(state.activeSeries.value);
+
+  assert.equal(state.seriesBaseTitle.value, '万妖图录传');
+  assert.equal(state.relatedSeasons.value.length, 14);
+
+  // Assert strictly ascending sorted order: Season 1 to Season 14
+  for (let i = 0; i < 14; i++) {
+    assert.equal(state.relatedSeasons.value[i].seasonNum, i + 1);
+  }
+});
+
+test('selectSeason switches active drama in theater, closes modal and resets sidebar tab', async () => {
+  let theaterOpenedWith = null;
+  const state = client(async (url) => {
+    if (url.startsWith('/api/series/')) {
+      const id = url.split('/').pop();
+      theaterOpenedWith = id;
+      return response({
+        series_id: id,
+        series_title: '剧集第' + id + '季',
+        episodes: [{ vid: id + '_1', vid_index: 1 }]
+      });
+    }
+    return response({ results: [] });
+  });
+
+  state.activeSeries.value = { series_id: '1' };
+  state.showSeasonsModal.value = true;
+  state.sidebarTab.value = 'seasons';
+
+  await state.selectSeason({ series_id: '2', series_title: '剧集第二季' });
+
+  assert.equal(theaterOpenedWith, '2');
+  assert.equal(state.showSeasonsModal.value, false);
+  assert.equal(state.sidebarTab.value, 'episodes');
+});
+
+test('searchSeriesGlobally closes modal, exits theater and initiates search', async () => {
+  let searchHandled = false;
+  const state = client(async (url) => {
+    if (url.startsWith('/api/search')) {
+      searchHandled = true;
+      return response({ results: [] });
+    }
+    return response({});
+  });
+
+  state.viewMode.value = 'theater';
+  state.showSeasonsModal.value = true;
+  state.seriesBaseTitle.value = '万妖图录传';
+
+  state.searchSeriesGlobally('万妖图录传');
+
+  assert.equal(state.showSeasonsModal.value, false);
+  assert.equal(state.viewMode.value, 'catalog');
+  assert.equal(state.searchKeyword.value, '万妖图录传');
+  assert.equal(state.currentTab.value, 'search');
+});
+
+test('copyDramaTitle copies title to clipboard and gives feedback', async () => {
+  let clipboardText = '';
+  const state = client(async () => response({}), {
+    navigator: {
+      userAgent: '',
+      clipboard: {
+        writeText: async (t) => { clipboardText = t; }
+      }
+    }
+  });
+
+  state.activeSeries.value = { series_title: '万妖图录传第一季' };
+  await state.copyDramaTitle();
+
+  assert.equal(clipboardText, '万妖图录传第一季');
+  assert.equal(state.titleCopied.value, true);
+});
+
+test('index.html and app.css include multi-season navigation and text selection styles', () => {
+  const path = require('node:path');
+  const html = fs.readFileSync(path.resolve(__dirname, '../../src/client/index.html'), 'utf-8');
+  const css = fs.readFileSync(path.resolve(__dirname, '../../src/client/css/app.css'), 'utf-8');
+
+  // Verify series seasons button and icon in sidebar header
+  assert.ok(html.includes('sidebar-seasons-btn'), 'sidebar-seasons-btn must be present in index.html');
+  assert.ok(html.includes('📚'), 'Book icon must be used');
+  assert.ok(html.includes('系列全季'), 'Label must include 系列全季');
+
+  // Verify sidebar view tabs and seasons panel
+  assert.ok(html.includes('sidebar-view-tabs'), 'sidebar-view-tabs must be present');
+  assert.ok(html.includes('sidebar-seasons-panel'), 'sidebar-seasons-panel must be present');
+
+  // Verify copy title button in drama modal
+  assert.ok(html.includes('modal-copy-btn'), 'modal-copy-btn must be present');
+  assert.ok(html.includes('copyDramaTitle'), 'copyDramaTitle method must be bound');
+
+  // Verify full seasons modal dialog and elegant playing tag
+  assert.ok(html.includes('seasons-modal'), 'seasons-modal must be present');
+  assert.ok(html.includes('showSeasonsModal'), 'showSeasonsModal state must control modal');
+  assert.ok(html.includes('season-playing-tag'), 'season-playing-tag badge must be present');
+  assert.ok(html.includes('playing-bars'), 'Audio equalizer playing bars must be present');
+
+  // Verify CSS enables text selection for modals and descriptions
+  assert.ok(css.includes('user-select: text'), 'app.css must allow text selection');
+  assert.ok(css.includes('.drama-modal'), 'drama-modal must be styled for selectable text');
+  assert.ok(css.includes('.seasons-modal'), 'seasons-modal styles must exist');
+  assert.ok(css.includes('.season-playing-tag'), 'season-playing-tag styling must exist');
 });
