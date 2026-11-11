@@ -1,5 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { gunzipSync } = require('node:zlib');
+const { createHash } = require('node:crypto');
 const appSource = require('../../src/server/native/app-source');
 
 function mockEntry(vid) {
@@ -89,7 +91,15 @@ test('fetchAppPlayUrl batches nextVids and caches returned models in entryCache'
     if (url.includes('register')) {
       return { code: 0, device_id_str: '999', install_id_str: '888' };
     }
-    requests.push({ url, body: JSON.parse(options.data) });
+    assert.equal(options.headers['Content-Encoding'], 'gzip');
+    assert.ok(options.headers['x-argus']);
+    assert.ok(options.headers['x-ladon']);
+    assert.equal(options.headers['x-ss-stub'], createHash('md5').update(options.data).digest('hex').toUpperCase());
+    assert.ok(options.headers['x-ss-req-ticket']);
+    assert.equal(new URL(url).searchParams.get('aid'), '8662');
+    assert.equal(new URL(url).searchParams.get('version_name'), '7.4.3.32');
+    assert.ok(options.headers['User-Agent'].includes('74332'));
+    requests.push({ url, body: JSON.parse(gunzipSync(options.data)) });
     return {
       code: 0,
       data: {
@@ -150,6 +160,42 @@ test('fetchAppPlayUrl retries on EMPTY_RESPONSE from upstream API', async () => 
     const play = await appSource.fetchAppPlayUrl('20001');
     assert.equal(play.url, 'https://qznovelvod.com/video_20001.mp4');
     assert.equal(calls, 2);
+  } finally {
+    appSource.requestJson = originalRequest;
+    appSource.clearEntryCache();
+  }
+});
+
+test('fetchAppPlayUrl self-heals by falling back to verified default device when both endpoints return EMPTY_RESPONSE', async () => {
+  const originalRequest = appSource.requestJson;
+  appSource.clearEntryCache();
+  const urls = [];
+
+  appSource.requestJson = async (url) => {
+    if (url.includes('register')) {
+      return { code: 0, device_id_str: '999', install_id_str: '888' };
+    }
+    urls.push(url);
+    if (urls.length <= 2) {
+      // Primary and secondary fail for current registered device (999)
+      throw Object.assign(new Error('App upstream returned empty response'), { code: 'EMPTY_RESPONSE' });
+    }
+    // Succeeded on retry with verified default device
+    return {
+      code: 0,
+      data: {
+        '20002': mockEntry('20002')
+      }
+    };
+  };
+
+  try {
+    const play = await appSource.fetchAppPlayUrl('20002');
+    assert.equal(play.url, 'https://qznovelvod.com/video_20002.mp4');
+    assert.equal(urls.length, 3);
+    assert.ok(urls[0].includes('reading.snssdk.com'));
+    assert.ok(urls[1].includes('api5-normal-sinfonlinea.fqnovel.com'));
+    assert.ok(urls[2].includes('device_id=1624456208323876'), 'Fallback request should use DEFAULT_VERIFIED_DEVICE');
   } finally {
     appSource.requestJson = originalRequest;
     appSource.clearEntryCache();
