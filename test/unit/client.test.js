@@ -203,7 +203,14 @@ test('shortcuts work when focus is on buttons and range inputs, and ignore text 
   listeners.keydown({ target: { tagName: 'INPUT', type: 'range', blur }, code: 'Space', key: ' ', preventDefault: prevent });
   assert.equal(paused, true);
 
-  // 6. When typing in a text input (e.g. search box), shortcuts are ignored
+  // 6. Pressing J toggles sidebarOpen
+  assert.equal(state.sidebarOpen.value, true);
+  listeners.keydown({ target: { tagName: 'BUTTON', blur }, code: 'KeyJ', key: 'j', preventDefault: prevent });
+  assert.equal(state.sidebarOpen.value, false);
+  listeners.keydown({ target: { tagName: 'BUTTON', blur }, code: 'KeyJ', key: 'J', preventDefault: prevent });
+  assert.equal(state.sidebarOpen.value, true);
+
+  // 7. When typing in a text input (e.g. search box), shortcuts are ignored
   listeners.keydown({ target: { tagName: 'INPUT', type: 'text' }, code: 'Space', key: ' ', preventDefault: prevent });
   assert.equal(paused, true); // not toggled
 });
@@ -1089,6 +1096,7 @@ test('index.html layout includes header hamburger menu button, dropdown menu, an
   assert.ok(html.includes('class="header-menu-container"'), 'Header menu container must exist');
   assert.ok(html.includes('class="header-menu-btn"'), 'Header hamburger menu button must exist');
   assert.ok(html.includes('class="header-dropdown-menu"'), 'Dropdown menu must exist');
+  assert.ok(html.includes('resetDevice'), 'Reset device menu item must exist');
   assert.ok(html.includes('openShortcutsModal'), 'Shortcuts item must exist');
   assert.ok(html.includes('openLogDir'), 'Open log dir item must exist');
   assert.ok(html.includes('openLogFile'), 'Open log file item must exist');
@@ -1135,6 +1143,26 @@ test('app menu toggles and modals open and close correctly', async () => {
 
   await state.openLogFile();
   assert.equal(fetchPostUrl, '/api/system/open-log-file');
+  assert.equal(state.showAppMenu.value, false);
+});
+
+test('resetDevice triggers POST /api/device/reset and updates currentDeviceId', async () => {
+  let requestedUrl = null;
+  const state = client(async (url, opts) => {
+    requestedUrl = url;
+    if (url === '/api/device/reset') {
+      return response({ success: true, device: { device_id: '999888777' } });
+    }
+    if (url === '/api/device') {
+      return response({ success: true, device_id: '123456789' });
+    }
+    return response([]);
+  });
+
+  state.showAppMenu.value = true;
+  await state.resetDevice();
+  assert.equal(requestedUrl, '/api/device/reset');
+  assert.equal(state.currentDeviceId.value, '999888777');
   assert.equal(state.showAppMenu.value, false);
 });
 
@@ -1372,6 +1400,9 @@ test('danmaku engine receives episode comments and is replaced when switching ep
     constructor(options) { this.options = options; instances.push(this); }
     destroy() { this.destroyed = true; }
     resize() {}
+    play() { this.playing = true; }
+    pause() { this.playing = false; }
+    seek() { this.seeked = true; }
   }
   const state = client(async url => url.startsWith('/api/danmaku/')
     ? response({ success: true, items: [{ time: 2, text: url.includes('111111') ? 'first' : 'second', likes: 0 }] })
@@ -1506,6 +1537,33 @@ test('late danmaku interval preferences rebuild the active engine but do not ove
   finishSecondPreferences(response({ danmakuMergeInterval: 15 }));
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(changed.danmakuMergeInterval.value, 60);
+});
+
+test('seekFromSlider and finishScrubbing invoke danmakuEngine seek', async () => {
+  let seekCalled = 0;
+  class FakeDanmaku {
+    constructor(options) { this.options = options; }
+    destroy() {}
+    resize() {}
+    seek() { seekCalled++; }
+    play() {}
+    pause() {}
+  }
+  const state = client(async url => url.startsWith('/api/danmaku/')
+    ? response({ success: true, items: [{ time: 10, text: 'danmaku', likes: 1 }] })
+    : response({ series_id: '123456', episodes: [{ vid: '111111', vid_index: 1 }] }),
+  { Danmaku: FakeDanmaku });
+  state.danmakuLayer.value = { offsetWidth: 800, offsetHeight: 96 };
+  await state.openTheater({ series_id: '123456' });
+  state.videoEl.value = { pause() {}, play() { return Promise.resolve(); }, currentTime: 0 };
+  state.duration.value = 100;
+  await new Promise(resolve => setImmediate(resolve));
+  state.seekFromSlider({ target: { value: 25 } });
+  assert.equal(state.videoEl.value.currentTime, 25);
+  assert.ok(seekCalled >= 1);
+  const beforeScrub = seekCalled;
+  state.finishScrubbing();
+  assert.ok(seekCalled > beforeScrub);
 });
 
 test('search history selection searches again and supports removal', async () => {
@@ -1861,4 +1919,44 @@ test('index.html and app.css include multi-season navigation and text selection 
   assert.ok(css.includes('.drama-modal'), 'drama-modal must be styled for selectable text');
   assert.ok(css.includes('.seasons-modal'), 'seasons-modal styles must exist');
   assert.ok(css.includes('.season-playing-tag'), 'season-playing-tag styling must exist');
+});
+
+test('video resolution badge reflects loaded metadata dimensions and keyboard-hints are removed', () => {
+  const path = require('node:path');
+  const html = fs.readFileSync(path.resolve(__dirname, '../../src/client/index.html'), 'utf-8');
+  const css = fs.readFileSync(path.resolve(__dirname, '../../src/client/css/app.css'), 'utf-8');
+
+  // Verify keyboard-hints bar is removed
+  assert.ok(!html.includes('class="keyboard-hints"'), 'keyboard-hints bar should be removed from index.html');
+
+  // Verify resolution badge is in index.html and app.css
+  assert.ok(html.includes('class="resolution-badge"'), 'resolution-badge should be present in index.html');
+  assert.ok(css.includes('.resolution-badge'), '.resolution-badge styling should be in app.css');
+
+  // Verify client resolution logic
+  const state = client(async () => response({}));
+  assert.equal(state.videoResolution.value.width, 0);
+  assert.equal(state.resolutionText.value, '');
+
+  state.videoEl.value = { videoWidth: 1080, videoHeight: 1920, duration: 100, volume: 1, pause() {} };
+  state.onLoadedMetadata();
+  assert.equal(state.videoResolution.value.width, 1080);
+  assert.equal(state.videoResolution.value.height, 1920);
+  assert.equal(state.resolutionText.value, '1080p');
+  assert.ok(state.resolutionTitle.value.includes('1080 × 1920 (1080p)'));
+
+  // Test horizontal 720p
+  state.videoEl.value = { videoWidth: 1280, videoHeight: 720, pause() {} };
+  state.onCanPlay();
+  assert.equal(state.resolutionText.value, '720p');
+
+  // Test 4K
+  state.videoEl.value = { videoWidth: 3840, videoHeight: 2160, pause() {} };
+  state.onCanPlay();
+  assert.equal(state.resolutionText.value, '4K');
+
+  // Test leaving theater resets resolution
+  state.closeTheater();
+  assert.equal(state.videoResolution.value.width, 0);
+  assert.equal(state.resolutionText.value, '');
 });

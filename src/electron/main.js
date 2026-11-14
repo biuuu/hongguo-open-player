@@ -260,6 +260,14 @@ function setupMenu() {
                 label: '关于 红果开源播放器',
                 click: () => showAboutDialog()
               },
+              {
+                label: '生成新的设备 ID',
+                click: () => {
+                  if (mainWindow && !mainWindow.isDestroyed()) {
+                    mainWindow.webContents.executeJavaScript('window.__app?.resetDevice?.()').catch(console.error);
+                  }
+                }
+              },
               { type: 'separator' },
               { role: 'services', label: '服务' },
               { type: 'separator' },
@@ -324,6 +332,14 @@ function setupMenu() {
         {
           label: '关于 红果开源播放器',
           click: () => showAboutDialog()
+        },
+        {
+          label: '生成新的设备 ID',
+          click: () => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.executeJavaScript('window.__app?.resetDevice?.()').catch(console.error);
+            }
+          }
         },
         {
           label: 'GitHub 项目主页',

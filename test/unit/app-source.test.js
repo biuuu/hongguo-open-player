@@ -166,7 +166,7 @@ test('fetchAppPlayUrl retries on EMPTY_RESPONSE from upstream API', async () => 
   }
 });
 
-test('fetchAppPlayUrl self-heals by falling back to verified default device when both endpoints return EMPTY_RESPONSE', async () => {
+test('fetchAppPlayUrl falls back to shortplay channel with same device when primary and secondary endpoints return EMPTY_RESPONSE', async () => {
   const originalRequest = appSource.requestJson;
   appSource.clearEntryCache();
   const urls = [];
@@ -180,7 +180,7 @@ test('fetchAppPlayUrl self-heals by falling back to verified default device when
       // Primary and secondary fail for current registered device (999)
       throw Object.assign(new Error('App upstream returned empty response'), { code: 'EMPTY_RESPONSE' });
     }
-    // Succeeded on retry with verified default device
+    // Succeeded on shortplay fallback with the same registered device
     return {
       code: 0,
       data: {
@@ -195,7 +195,63 @@ test('fetchAppPlayUrl self-heals by falling back to verified default device when
     assert.equal(urls.length, 3);
     assert.ok(urls[0].includes('reading.snssdk.com'));
     assert.ok(urls[1].includes('api5-normal-sinfonlinea.fqnovel.com'));
-    assert.ok(urls[2].includes('device_id=1624456208323876'), 'Fallback request should use DEFAULT_VERIFIED_DEVICE');
+    assert.ok(urls[2].includes('novel/player/video_model/v1/'));
+    assert.ok(urls[2].includes('device_id=999'), 'Fallback request should use the same active device');
+  } finally {
+    appSource.requestJson = originalRequest;
+    appSource.clearEntryCache();
+  }
+});
+
+test('fetchAppPlayUrl selects highest resolution when multiple streams of different definitions exist', async () => {
+  const originalRequest = appSource.requestJson;
+  appSource.clearEntryCache();
+  const entry = {
+    video_model: JSON.stringify({
+      video_list: [
+        {
+          definition: '720p',
+          vtype: 'mp4',
+          codec_type: 'h264',
+          main_url: 'https://qznovelvod.com/video_720.mp4',
+          vwidth: 720,
+          vheight: 1280,
+          encrypt_info: { encrypt: false }
+        },
+        {
+          definition: '1080p',
+          vtype: 'mp4',
+          codec_type: 'bytevc1',
+          main_url: 'https://qznovelvod.com/video_1080.mp4',
+          vwidth: 1080,
+          vheight: 1920,
+          encrypt_info: { encrypt: false }
+        },
+        {
+          definition: '540p',
+          vtype: 'mp4',
+          codec_type: 'h264',
+          main_url: 'https://qznovelvod.com/video_540.mp4',
+          vwidth: 540,
+          vheight: 960,
+          encrypt_info: { encrypt: false }
+        }
+      ]
+    })
+  };
+
+  appSource.requestJson = async (url) => {
+    if (url.includes('register')) {
+      return { code: 0, device_id_str: '999', install_id_str: '888' };
+    }
+    return { code: 0, data: { '40001': entry } };
+  };
+
+  try {
+    const play = await appSource.fetchAppPlayUrl('40001', { quality: 'auto' });
+    assert.equal(play.quality, '1080p');
+    assert.equal(play.url, 'https://qznovelvod.com/video_1080.mp4');
+    assert.equal(play.codec, 'hevc');
   } finally {
     appSource.requestJson = originalRequest;
     appSource.clearEntryCache();

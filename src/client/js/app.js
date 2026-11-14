@@ -6,7 +6,7 @@ const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.us
 const isDesktop = /Electron\//.test(navigator.userAgent);
 document.documentElement.classList.add(isDesktop ? (isMac ? 'platform-mac' : /Windows/i.test(navigator.userAgent) ? 'platform-win' : 'platform-linux') : 'platform-browser');
 
-createApp({
+const app = createApp({
   setup() {
     // 视图模式与导航状态
     const viewMode = ref('catalog'); // 'catalog' | 'theater'
@@ -68,6 +68,29 @@ createApp({
     }
     const volume = ref(1.0);
     const isMuted = ref(false);
+    const videoResolution = ref({ width: 0, height: 0 });
+
+    const resolutionText = computed(() => {
+      const w = videoResolution.value.width;
+      const h = videoResolution.value.height;
+      if (!w || !h) return '';
+      const minDim = Math.min(w, h);
+      if (minDim >= 2160) return '4K';
+      if (minDim >= 1440) return '2K';
+      if (minDim >= 1080) return '1080p';
+      if (minDim >= 720) return '720p';
+      if (minDim >= 540) return '540p';
+      if (minDim >= 480) return '480p';
+      if (minDim >= 360) return '360p';
+      return `${minDim}p`;
+    });
+
+    const resolutionTitle = computed(() => {
+      const w = videoResolution.value.width;
+      const h = videoResolution.value.height;
+      if (!w || !h) return '分辨率加载中';
+      return `当前视频分辨率：${w} × ${h} (${resolutionText.value})`;
+    });
     const watchedMap = ref(new Map()); // seriesId -> Set(epIndexes)
     let progressTimer = null;
     let pendingResumeSec = 0;
@@ -106,6 +129,8 @@ createApp({
     const seasonsCache = new Map();
     let currentSeasonsRequest = 0;
     const showAppMenu = ref(false);
+    const currentDeviceId = ref('');
+    const isResettingDevice = ref(false);
     const danmakuEnabled = ref(true);
     const showDanmakuSettings = ref(false);
     const danmakuLayer = ref(null);
@@ -261,7 +286,13 @@ createApp({
     }
 
     function startDanmakuAnimation() {
-      if (danmakuEngine || !danmakuEnabled.value || !videoEl.value || !danmakuLayer.value || typeof Danmaku === 'undefined') return;
+      if (!danmakuEnabled.value || !videoEl.value || !danmakuLayer.value || typeof Danmaku === 'undefined') return;
+      if (danmakuEngine) {
+        if (videoEl.value && !videoEl.value.paused) {
+          danmakuEngine.play?.();
+        }
+        return;
+      }
       const layer = danmakuLayer.value;
       const lastShown = new Map();
       const merged = [...danmakuItems.value].sort((a, b) => a.time - b.time).filter(item => {
@@ -294,6 +325,10 @@ createApp({
         }
       }));
       danmakuEngine = new Danmaku({ container: layer, media: videoEl.value, comments, speed: danmakuSpeedForWidth(layer.offsetWidth) });
+      if (videoEl.value && !videoEl.value.paused) {
+        danmakuEngine.seek?.();
+        danmakuEngine.play?.();
+      }
       const resize = () => {
         if (!danmakuEngine || !layer.offsetWidth || !layer.offsetHeight) return;
         danmakuEngine.speed = danmakuSpeedForWidth(layer.offsetWidth);
@@ -411,6 +446,40 @@ createApp({
       showAppMenu.value = false;
     }
 
+    async function fetchDeviceInfo() {
+      try {
+        const response = await fetch('/api/device');
+        const data = await response.json();
+        if (data?.device_id) {
+          currentDeviceId.value = data.device_id;
+        }
+      } catch (_) {}
+    }
+
+    async function resetDevice() {
+      showAppMenu.value = false;
+      if (isResettingDevice.value) return;
+      isResettingDevice.value = true;
+      notify('正在向官方注册并生成新设备...');
+      try {
+        const response = await fetch('/api/device/reset', { method: 'POST' });
+        const data = await response.json();
+        if (data?.success && data?.device?.device_id) {
+          currentDeviceId.value = data.device.device_id;
+          notify(`已生成新设备 ID: ${data.device.device_id}`);
+          if (viewMode.value === 'theater' && typeof loadDanmaku === 'function') {
+            loadDanmaku(true);
+          }
+        } else {
+          notify(data?.error || '生成新设备失败，请稍后重试');
+        }
+      } catch (err) {
+        notify('生成新设备网络异常: ' + (err.message || '请重试'));
+      } finally {
+        isResettingDevice.value = false;
+      }
+    }
+
     function openAboutModal() {
       showAppMenu.value = false;
       showAboutModal.value = true;
@@ -418,6 +487,7 @@ createApp({
         if (!res.ok) throw new Error('version unavailable');
         return res.json();
       }).then(data => { appVersion.value = typeof data.version === 'string' ? data.version : ''; }).catch(() => { appVersion.value = ''; });
+      fetchDeviceInfo();
     }
 
     function closeAboutModal() {
@@ -586,6 +656,7 @@ createApp({
       const target = Math.max(0, Math.min(duration.value, Number(event.target.value)));
       videoEl.value.currentTime = target;
       currentTime.value = target;
+      danmakuEngine?.seek?.();
     }
     function startScrubbing(event) {
       isScrubbing.value = true;
@@ -599,6 +670,7 @@ createApp({
       saveProgressNow();
       event?.target?.blur?.();
       keepPlayerFocus();
+      danmakuEngine?.seek?.();
       resetControlsTimer();
     }
     function notify(message) {
@@ -1395,6 +1467,7 @@ createApp({
       bytevc2FallbackActive = false;
       lastNearEndPrefetch = 0;
       stopDanmakuAnimation();
+      danmakuKey = '';
       progressReady = false;
       pendingResumeSec = 0;
       currentTime.value = 0;
@@ -1406,9 +1479,10 @@ createApp({
     function leaveTheater() {
       theaterRequest++;
       saveProgressNow();
-      if (videoEl.value) videoEl.value.pause();
+      if (videoEl.value && typeof videoEl.value.pause === 'function') videoEl.value.pause();
       resetPlayback();
       miniControlsHovered = false;
+      videoResolution.value = { width: 0, height: 0 };
       setControlsHidden(false);
       clearTimeout(controlsHideTimer);
       showDramaDetailModal.value = false;
@@ -1652,6 +1726,7 @@ createApp({
       isPlaying.value = true;
       loadDanmaku();
       startDanmakuAnimation();
+      danmakuEngine?.play?.();
       markWatched(activeEpisodeIndex.value);
       if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing';
       isBuffering.value = false;
@@ -1662,11 +1737,18 @@ createApp({
     function onCanPlay(event) {
       if (event && event.target !== videoEl.value) return;
       isBuffering.value = false;
+      if (videoEl.value?.videoWidth && videoEl.value?.videoHeight) {
+        videoResolution.value = {
+          width: videoEl.value.videoWidth,
+          height: videoEl.value.videoHeight
+        };
+      }
     }
 
     function onPause(event) {
       if (event && event.target !== videoEl.value) return;
       isPlaying.value = false;
+      danmakuEngine?.pause?.();
       if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused';
       saveProgressNow();
       if (isMiniMode.value) refreshControlsForPlayback();
@@ -1681,6 +1763,12 @@ createApp({
       if (videoEl.value) {
         progressReady = true;
         duration.value = videoEl.value.duration || 0;
+        if (videoEl.value.videoWidth && videoEl.value.videoHeight) {
+          videoResolution.value = {
+            width: videoEl.value.videoWidth,
+            height: videoEl.value.videoHeight
+          };
+        }
         videoEl.value.volume = Number(volume.value);
         videoEl.value.muted = isMuted.value;
         if (navigator.mediaSession && typeof MediaMetadata !== 'undefined') {
@@ -1691,6 +1779,7 @@ createApp({
         if (pendingResumeSec > 0 && pendingResumeSec < duration.value) {
           try {
             videoEl.value.currentTime = pendingResumeSec;
+            danmakuEngine?.seek?.();
           } catch (e) {
             console.warn('恢复历史播放位置失败:', e);
           }
@@ -1957,6 +2046,11 @@ createApp({
           e.preventDefault();
           toggleMute();
           showOSD(isMuted.value ? '静音' : '开启声音');
+        } else if (e.key?.toLowerCase() === 'j') {
+          e.preventDefault();
+          e.target?.blur?.();
+          sidebarOpen.value = !sidebarOpen.value;
+          showOSD(sidebarOpen.value ? '显示选集侧栏' : '隐藏选集侧栏');
         } else if (e.key?.toLowerCase() === 'f') {
           e.preventDefault();
           e.target?.blur?.();
@@ -2005,6 +2099,7 @@ createApp({
     }
 
     onMounted(() => {
+      fetchDeviceInfo();
       loadPreferences();
       loadSearchHistory();
       loadCatalog();
@@ -2087,6 +2182,7 @@ createApp({
       playbackRate, showSpeedMenu, selectSpeed,
       volume,
       isMuted,
+      videoResolution, resolutionText, resolutionTitle,
       currentGroup,
       currentStreamUrl,
       episodeGroups,
@@ -2183,7 +2279,15 @@ createApp({
       closeShortcutsModal,
       openLogDir,
       openLogFile,
-      openGithubRepo
+      openGithubRepo,
+      resetDevice,
+      currentDeviceId,
+      isResettingDevice
     };
   }
-}).mount('#app');
+});
+if (typeof window !== 'undefined') {
+  window.__app = app.mount('#app');
+} else {
+  app.mount('#app');
+}

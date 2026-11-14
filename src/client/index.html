@@ -72,6 +72,10 @@
 
           <!-- 下拉菜单 -->
           <div v-if="showAppMenu" class="header-dropdown-menu" @click.stop>
+            <button class="dropdown-item" @click="resetDevice" :disabled="isResettingDevice">
+              <span class="dropdown-icon">🔄</span>
+              <span class="dropdown-label">{{ isResettingDevice ? '正在生成新设备...' : '生成新的设备ID' }}</span>
+            </button>
             <button class="dropdown-item" @click="openShortcutsModal">
               <span class="dropdown-icon">⌨️</span>
               <span class="dropdown-label">快捷键指南</span>
@@ -299,7 +303,7 @@
                 @click="sidebarOpen = !sidebarOpen" 
                 :aria-expanded="sidebarOpen" 
                 aria-controls="episode-sidebar" 
-                :title="sidebarOpen ? '隐藏侧边栏' : '显示侧边栏'"
+                :title="(sidebarOpen ? '隐藏侧边栏' : '显示侧边栏') + ' (J)'"
               >
                 <svg v-if="sidebarOpen" class="sidebar-toggle-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
                   <rect x="2" y="3" width="16" height="14" rx="2"/><path d="M13 3v14"/><path d="M5 10h5M8 7.5 10.5 10 8 12.5"/>
@@ -408,6 +412,10 @@
                     <button v-for="rate in ['0.75', '1.0', '1.25', '1.5', '2.0']" :key="rate" :class="{ active: playbackRate === rate }" :aria-pressed="playbackRate === rate" @click="selectSpeed(rate)">{{ rate }}x <span v-if="playbackRate === rate" aria-hidden="true">✓</span></button>
                   </div>
                 </div>
+                <!-- 视频清晰度/分辨率标签 -->
+                <div v-if="resolutionText" class="resolution-badge" :title="resolutionTitle" aria-label="当前分辨率">
+                  {{ resolutionText }}
+                </div>
                 <!-- 音量 -->
                 <div class="volume-box">
                   <button class="ctrl-btn volume-btn" @click="toggleMute">{{ isMuted ? '🔇' : '🔊' }}</button>
@@ -417,14 +425,6 @@
                 <!-- 全屏 -->
                 <button class="ctrl-btn fullscreen-btn" @click="toggleFullscreen" title="全屏 (F)">⛶</button>
               </div>
-            </div>
-
-            <!-- 键盘快捷键提示小条 -->
-            <div class="keyboard-hints">
-              <span>快捷键：[空格] 播放/暂停</span>
-              <span>[↑/↓] 上下集切换</span>
-              <span>[←/→] 快退/快进 5s</span>
-              <span>[F] 或 [双击] 全屏</span>
             </div>
           </div>
         </div>
@@ -903,6 +903,10 @@
               <div class="desc">静音 / 恢复声音</div>
             </div>
             <div class="shortcut-item">
+              <div class="keys"><kbd>J</kbd></div>
+              <div class="desc">显示 / 隐藏选集侧边栏</div>
+            </div>
+            <div class="shortcut-item">
               <div class="keys"><kbd>Esc</kbd></div>
               <div class="desc">退出全屏 / 关闭当前弹窗</div>
             </div>
@@ -944,6 +948,10 @@
             <span class="about-tag">⚡ 智能节点加速</span>
           </div>
           <div class="about-meta-list">
+            <div class="about-meta-item">
+              <span class="meta-label">设备标识：</span>
+              <span class="meta-value" style="font-family: monospace; font-size: 12px; user-select: text;">{{ currentDeviceId || '获取中...' }}</span>
+            </div>
             <div class="about-meta-item">
               <span class="meta-label">开源许可：</span>
               <span class="meta-value">GPL-3.0 License</span>

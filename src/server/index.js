@@ -33,6 +33,25 @@ app.use((req, res, next) => {
   }
   next();
 });
+// 核心 API 请求访问与耗时日志中间件 (用于日常排错与运行诊断，置于最前以确保 401/403 等均被完整记录)
+app.use((req, res, next) => {
+  if (req.path.toLowerCase().startsWith('/api/')) {
+    const t0 = Date.now();
+    res.on('finish', () => {
+      const duration = Date.now() - t0;
+      const msg = `${req.method} ${req.originalUrl || req.url} -> ${res.statusCode} (${duration}ms)`;
+      if (res.statusCode >= 500) {
+        logger.error('API', msg);
+      } else if (res.statusCode >= 400 && res.getHeader('X-Stream-Mode') !== 'bytevc2-progressive') {
+        logger.warn('API', msg);
+      } else {
+        logger.info('API', msg);
+      }
+    });
+  }
+  next();
+});
+
 app.use((req, res, next) => {
   const normalizedPath = req.path.toLowerCase();
   const port = req.socket?.localPort;
@@ -52,25 +71,6 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: '64kb' }));
-
-// 核心 API 请求访问与耗时日志中间件 (用于日常排错与运行诊断)
-app.use((req, res, next) => {
-  if (req.path.toLowerCase().startsWith('/api/')) {
-    const t0 = Date.now();
-    res.on('finish', () => {
-      const duration = Date.now() - t0;
-      const msg = `${req.method} ${req.originalUrl || req.url} -> ${res.statusCode} (${duration}ms)`;
-      if (res.statusCode >= 500) {
-        logger.error('API', msg);
-      } else if (res.statusCode >= 400 && res.getHeader('X-Stream-Mode') !== 'bytevc2-progressive') {
-        logger.warn('API', msg);
-      } else {
-        logger.info('API', msg);
-      }
-    });
-  }
-  next();
-});
 
 // 静态前端资源目录
 const clientDir = path.join(__dirname, '../client');
@@ -94,6 +94,52 @@ function sendApiError(res, error) {
 app.get('/api/system/version', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ version: require('../../package.json').version });
+});
+
+/**
+ * 获取当前活跃匿名设备信息
+ */
+app.get('/api/device', async (_req, res) => {
+  try {
+    const { getPlaybackDevice } = require('./native/playback-device');
+    const { requestJson } = require('./native/app-source');
+    const device = await getPlaybackDevice(requestJson);
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      device_id: device.device_id,
+      iid: device.iid,
+      created_at: device.created_at
+    });
+  } catch (err) {
+    sendApiError(res, err);
+  }
+});
+
+/**
+ * 用户主动生成并切换新设备
+ */
+app.post('/api/device/reset', async (_req, res) => {
+  try {
+    const { getPlaybackDevice } = require('./native/playback-device');
+    const { requestJson } = require('./native/app-source');
+    const danmakuService = require('./native/danmaku');
+    logger.info('Device', '收到用户主动更换设备指令，开始注册全新的独立匿名设备...');
+    const newDevice = await getPlaybackDevice.rotateDevice(requestJson);
+    danmakuService.resetDanmakuCache();
+    logger.info('Device', `新设备生成成功: device_id=${newDevice.device_id}, iid=${newDevice.iid}`);
+    res.set('Cache-Control', 'no-store');
+    res.json({
+      success: true,
+      device: {
+        device_id: newDevice.device_id,
+        iid: newDevice.iid,
+        created_at: newDevice.created_at
+      }
+    });
+  } catch (err) {
+    sendApiError(res, err);
+  }
 });
 
 app.get('/api/danmaku/:seriesId/:vid', async (req, res) => {
