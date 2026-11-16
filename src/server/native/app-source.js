@@ -9,6 +9,7 @@ const crypto = require('node:crypto');
 const { gzipSync } = require('node:zlib');
 const logger = require('../services/logger');
 const { getPlaybackDevice } = require('./playback-device');
+const { deviceKey } = require('./device-session');
 const sm3 = require('./sm3');
 const { PlayerSigner } = require('./argus');
 const { normalizeDownloadQuality, meetsDownloadQuality } = require('./download-quality');
@@ -17,7 +18,19 @@ const PROCESS_NONCE = crypto.randomBytes(18).toString('base64url');
 const PROCESS_STARTED = Date.now();
 const VIDEO_API = 'https://reading.snssdk.com/novel/player/multi_video_model/player/v1';
 const VIDEO_API_FALLBACK = 'https://api5-normal-sinfonlinea.fqnovel.com/novel/player/multi_video_model/player/v1';
+const VIDEO_APIS = [
+    VIDEO_API,
+    VIDEO_API_FALLBACK,
+    'https://api5-normal-lq.fqnovel.com/novel/player/multi_video_model/player/v1',
+    'https://is.snssdk.com/novel/player/multi_video_model/player/v1',
+    'https://api5-normal-hl.fqnovel.com/novel/player/multi_video_model/player/v1',
+];
 const SHORTPLAY_API = 'https://api3-normal-sinfonlinea.fqnovel.com/novel/player/video_model/v1/';
+const SHORTPLAY_APIS = [
+    SHORTPLAY_API,
+    'https://api5-normal-lq.fqnovel.com/novel/player/video_model/v1/',
+    'https://reading.snssdk.com/novel/player/video_model/v1/',
+];
 const SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
 const PLAYBACK_UA = 'com.phoenix.read/74332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
@@ -144,7 +157,6 @@ function playbackRequest(payload, identity, apiBase = VIDEO_API) {
     const query = pythonUrlEncode({ ...devParams, _rticket: requestTicket });
     const url = `${apiBase}?${query}`;
     const signerHeaders = PlayerSigner.headers(query, body, khronos);
-    const cookieHeader = identity?.cookie || (iid ? `store-region=cn-bj; store-region-src=did; install_id=${iid}` : '');
     const headers = {
         'User-Agent': PLAYBACK_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf',
         'Content-Type': 'application/json; charset=UTF-8', 'Content-Encoding': 'gzip',
@@ -152,11 +164,11 @@ function playbackRequest(payload, identity, apiBase = VIDEO_API) {
         'x-ss-dp': '8662',
         ...signerHeaders,
     };
-    if (cookieHeader) headers.Cookie = cookieHeader;
+    // The transport supplies cookies scoped to the destination from the active session.
     return { url, body, headers };
 }
 
-function shortplayRequest(vid, identity) {
+function shortplayRequest(vid, identity, apiBase = SHORTPLAY_API) {
     const khronos = Math.floor(Date.now() / 1000);
     const query = pythonUrlEncode({
         iid: identity?.iid || '',
@@ -170,7 +182,7 @@ function shortplayRequest(vid, identity) {
         os_version: '13',
         cdid: identity?.cdid || '',
     });
-    const url = `${SHORTPLAY_API}?${query}`;
+    const url = `${apiBase}?${query}`;
     const payload = JSON.stringify({
         video_id: String(vid),
         content_type: 1004,
@@ -187,7 +199,7 @@ function shortplayRequest(vid, identity) {
         'Content-Type': 'application/json; charset=utf-8',
         ...signerHeaders,
     };
-    if (identity?.cookie) headers.Cookie = identity.cookie;
+    // Session cookies are added by requestJson after domain/path/expiry checks.
     return { url, body, headers };
 }
 
@@ -335,25 +347,60 @@ function checkedUrl(value, domains) {
 
 async function requestJson(url, options, deadline, signal) {
     const axios = require('axios');
+    const requestId = crypto.randomUUID();
+    const { diagnostics, ...transportOptions } = options;
+    const identity = getPlaybackDevice.matchRequest(url);
     for (let redirects = 0; redirects < 4; redirects++) {
         url = checkedUrl(url, ['fqnovel.com', 'snssdk.com']);
         const timeout = deadline - Date.now();
         if (timeout <= 0) throw Object.assign(new Error('App 片源请求超时'), { code: 'ETIMEDOUT' });
+        const target = new URL(url);
+        const started = Date.now();
+        const session = identity && getPlaybackDevice.beginRequest(identity, url);
+        const headers = { ...options.headers };
+        if (session) {
+            for (const key of Object.keys(headers)) if (key.toLowerCase() === 'cookie') delete headers[key];
+            if (session.cookie) headers.Cookie = session.cookie;
+        }
+        const context = { request_id: requestId, host: target.hostname, path: target.pathname,
+            method: options.method || 'GET',
+            ...(session ? { idle_before_request_ms: session.idle_before_request_ms,
+                sent_cookie_names: session.cookie_names, sent_cookie_count: session.cookie_count } : {}),
+            ...(diagnostics ? { playback_id: diagnostics.playback_id, vid: diagnostics.vid } : {}),
+            ...(identity ? { device_key: deviceKey(identity) } : {}) };
         let response;
         try {
             response = await axios({
-                ...options, url, timeout, signal, maxRedirects: 0,
+                ...transportOptions, headers, url, timeout, signal, maxRedirects: 0,
                 responseType: 'text', transformResponse: [(data) => data],
                 maxContentLength: 2 * 1024 * 1024, maxBodyLength: 1024 * 1024,
                 validateStatus: () => true,
             });
         } catch (error) {
             const isAborted = Boolean(signal?.aborted);
-            const code = isAborted ? 'ETIMEDOUT' : ['ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
+            const code = isAborted ? (signal.reason?.name === 'TimeoutError' ? 'ETIMEDOUT' : 'ERR_CANCELED') : ['ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN',
                 'ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE', 'ERR_CANCELED'].includes(error.code) ? error.code : 'ERR_NETWORK';
+            const state = identity && getPlaybackDevice.recordResponse(identity, url, {}, code);
+            logger.warn('AppRequest', '接口网络异常', { ...context, elapsed_ms: Date.now() - started, outcome: code, ...state });
             throw Object.assign(new Error(['ECONNABORTED', 'ETIMEDOUT'].includes(code)
-                ? 'App 片源请求超时' : 'App 片源网络请求失败，请稍后重试'), { code });
+                ? 'App 片源请求超时' : 'App 片源网络请求失败，请稍后重试'), { code, requestId });
         }
+        const raw = typeof response.data === 'string' ? response.data : '';
+        const parsed = typeof response.data === 'string' ? jsonBody(raw) : response.data;
+        const businessCode = Number(parsed?.Code ?? parsed?.code ?? parsed?.status_code ?? 0);
+        const outcome = response.status !== 200 ? `HTTP_${response.status}` : !raw.trim() && typeof response.data === 'string'
+            ? 'EMPTY_RESPONSE' : !parsed || typeof parsed !== 'object' ? 'INVALID_RESPONSE'
+                : businessCode !== 0 ? 'BUSINESS_REJECTED' : 'ok';
+        const state = identity && getPlaybackDevice.recordResponse(identity, url, response.headers, outcome);
+        const logid = String(response.headers?.['x-tt-logid'] || '').slice(0, 128);
+        logger[outcome === 'ok' ? 'info' : 'warn']('AppRequest', '接口响应诊断', {
+            ...context, status: response.status, elapsed_ms: Date.now() - started,
+            response_bytes: Buffer.byteLength(raw), outcome, business_code: Number.isFinite(businessCode) ? businessCode : null,
+            logid, retry_after: String(response.headers?.['retry-after'] || '').slice(0, 64),
+            content_type: String(response.headers?.['content-type'] || '').slice(0, 128),
+            ...(diagnostics && target.pathname.includes('/player/')
+                ? { has_requested_video: Boolean(parsed?.data?.[diagnostics.vid] || parsed?.data?.video_model) } : {}), ...state,
+        });
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             // Do not resend a signed body to a redirect destination.
             if (options.method === 'POST' || !response.headers.location) throw Object.assign(new Error('App 接口发生不支持的跳转'), { code: 'SECURITY_BLOCKED' });
@@ -361,15 +408,13 @@ async function requestJson(url, options, deadline, signal) {
             continue;
         }
         if (response.status !== 200) throw Object.assign(new Error(`App 片源请求失败（HTTP ${response.status}）`), { status: response.status });
-        const raw = typeof response.data === 'string' ? response.data : '';
-        if (!raw.trim()) {
+        if (typeof response.data === 'string' && !raw.trim()) {
             throw Object.assign(new Error('App 接口返回空响应，可能是签名或设备鉴权问题'), {
                 code: 'EMPTY_RESPONSE',
                 status: response.status,
-                logid: response.headers?.['x-tt-logid'] || '',
+                logid, requestId,
             });
         }
-        const parsed = typeof response.data === 'string' ? jsonBody(raw) : response.data;
         if (!parsed || typeof parsed !== 'object') throw Object.assign(new Error('App 接口未返回有效数据'), { code: 'INVALID_RESPONSE' });
         if (response.headers) {
             Object.defineProperty(parsed, '_headers', {
@@ -385,13 +430,33 @@ async function requestJson(url, options, deadline, signal) {
 }
 
 const entryCache = new Map();
+const preferredRouteByDevice = new Map();
+const inFlightEntryRequests = new Map();
+const SHORTPLAY_PREF_TTL_MS = 300000;
+const FRESH_DEVICE_SYNC_WINDOW_MS = 15000;
+const FRESH_DEVICE_RETRY_DELAY_MS = 1500;
 
 function clearEntryCache(vid) {
-    if (vid) entryCache.delete(String(vid));
-    else entryCache.clear();
+    if (vid) {
+        const key = String(vid);
+        entryCache.delete(key);
+        inFlightEntryRequests.delete(key);
+    } else {
+        entryCache.clear();
+        preferredRouteByDevice.clear();
+        inFlightEntryRequests.clear();
+    }
 }
 
-async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQuality, deadline, signal, allowBytevc2 = false) {
+const H264_CODECS = ['h264', 'avc', 'avc1'];
+const HEVC_CODECS = ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'];
+const BYTEVC2_CODECS = ['bytevc2', 'bvc2'];
+
+function isHevcCodec(codec) {
+    return HEVC_CODECS.includes(str(codec).toLowerCase());
+}
+
+async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQuality, deadline, signal, allowBytevc2 = false, allowHevc = true, allowHevcTranscode = false) {
     const model = typeof entry?.video_model === 'string' ? jsonBody(entry.video_model) : entry?.video_model;
     if (!model) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: entry?.video_model ? 'INVALID_RESPONSE' : 'MISSING_MODEL' });
     const inline = Array.isArray(model.video_list) && model.video_list.length > 0;
@@ -408,7 +473,18 @@ async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQualit
     if (!info) throw Object.assign(new Error('App 接口未返回本集片源模型'), { code: 'MISSING_MODEL' });
     const candidates = Object.values(info?.video_list || {}).filter(item => item && (item.main_url || item.backup_url || Array.isArray(item.backup_url_list))).map(item => {
         const codec = str(item.codec_type || item.video_meta?.codec_type).toLowerCase();
-        const codecRank = ['h264', 'avc', 'avc1'].includes(codec) ? 0 : ['hevc', 'h265', 'hvc1', 'hev1', 'bytevc1'].includes(codec) ? 1 : allowBytevc2 && ['bytevc2', 'bvc2'].includes(codec) ? 2 : 3;
+        let codecRank = 3;
+        if (H264_CODECS.includes(codec)) {
+            codecRank = 0;
+        } else if (allowHevc) {
+            if (HEVC_CODECS.includes(codec)) codecRank = 1;
+            else if (allowBytevc2 && BYTEVC2_CODECS.includes(codec)) codecRank = 2;
+        } else {
+            // When the client cannot decode HEVC natively, prefer direct H.264 first,
+            // then ByteVC2 (transcoded via bundled ffmpeg), and finally HEVC transcode if supported.
+            if (allowBytevc2 && BYTEVC2_CODECS.includes(codec)) codecRank = 1;
+            else if (allowBytevc2 && allowHevcTranscode && HEVC_CODECS.includes(codec)) codecRank = 2;
+        }
         const quality = str(item.quality_desc || item.definition || item.video_meta?.definition || item.height || item.vheight);
         const meta = item.video_meta || {};
         const [width, height] = [[item.vwidth, item.vheight], [item.width, item.height], [meta.vwidth, meta.vheight], [meta.width, meta.height]]
@@ -416,8 +492,10 @@ async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQualit
         const pixels = width && height ? Math.min(width, height) : Number(quality.match(/\d+/)?.[0] || 0);
         return { item, codec, codecRank, quality, pixels, width, height };
     });
-    const hasCompatibleCodec = candidates.some(row => row.codecRank < 2);
-    const rows = candidates.filter(row => row.codecRank < (hasCompatibleCodec ? 2 : 3)
+    const maxAcceptedRank = allowHevc
+        ? (candidates.some(row => row.codecRank < 2) ? 2 : 3)
+        : (candidates.some(row => row.codecRank === 0) ? 1 : candidates.some(row => row.codecRank === 1) ? 2 : 3);
+    const rows = candidates.filter(row => row.codecRank < maxAcceptedRank
         && (allowLowerQuality || meetsDownloadQuality(row, requestedQuality))).sort((a, b) => {
         if (requestedQuality === 'auto') return b.pixels - a.pixels || a.codecRank - b.codecRank;
         const aMeets = meetsDownloadQuality(a, requestedQuality), bMeets = meetsDownloadQuality(b, requestedQuality);
@@ -425,9 +503,13 @@ async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQualit
         const aPixels = Math.min(a.width, a.height), bPixels = Math.min(b.width, b.height);
         return (aMeets ? aPixels - bPixels : bPixels - aPixels) || a.codecRank - b.codecRank;
     });
-    if (!allowBytevc2 && !rows.length && candidates.some(row => row.codec === 'bytevc2' || row.codec === 'bvc2')
+    if (!allowBytevc2 && !rows.length && candidates.some(row => BYTEVC2_CODECS.includes(row.codec))
         && !candidates.some(row => row.codecRank < 2)) {
         throw Object.assign(new Error('本集使用 ByteVC2 编码，当前播放器暂不支持'), { code: 'UNSUPPORTED_BYTEVC2' });
+    }
+    if (!allowHevc && !rows.length && candidates.some(row => HEVC_CODECS.includes(row.codec))
+        && !candidates.some(row => H264_CODECS.includes(row.codec))) {
+        throw Object.assign(new Error('当前设备不支持 HEVC (H.265) 硬件解码，且本集暂无兼容片源'), { code: 'UNSUPPORTED_HEVC' });
     }
     if (!rows.length) throw new Error(requestedQuality === 'auto' || allowLowerQuality
         ? '本集暂未提供兼容的 H.264/HEVC 片源'
@@ -472,6 +554,203 @@ async function parseEntryPlayInfo(vid, entry, requestedQuality, allowLowerQualit
         : Object.assign(new Error('本集片源地址或密钥无法解析'), { code: 'INVALID_RESPONSE' });
 }
 
+function sleepWithSignal(ms, signal) {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+        const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+function getPreferredRoute(devKey) {
+    if (!devKey) return null;
+    const pref = preferredRouteByDevice.get(devKey);
+    if (!pref) return null;
+    if (pref.expires && pref.expires <= Date.now()) {
+        preferredRouteByDevice.delete(devKey);
+        return null;
+    }
+    return pref;
+}
+
+function setPreferredRoute(devKey, kind, apiBase) {
+    if (!devKey || !apiBase) return;
+    preferredRouteByDevice.delete(devKey);
+    preferredRouteByDevice.set(devKey, kind === 'shortplay'
+        ? { kind, apiBase, expires: Date.now() + SHORTPLAY_PREF_TTL_MS }
+        : { kind, apiBase });
+    while (preferredRouteByDevice.size > 32) {
+        preferredRouteByDevice.delete(preferredRouteByDevice.keys().next().value);
+    }
+}
+
+function buildPlaybackSteps(devKey) {
+    const pref = getPreferredRoute(devKey);
+    if (pref?.kind === 'shortplay') {
+        const restShortplay = SHORTPLAY_APIS.filter(api => api !== pref.apiBase).map(apiBase => ({ kind: 'shortplay', apiBase }));
+        const multiSteps = VIDEO_APIS.map(apiBase => ({ kind: 'multi', apiBase }));
+        return [{ kind: 'shortplay', apiBase: pref.apiBase }, ...multiSteps, ...restShortplay];
+    }
+    const orderedMulti = pref?.kind === 'multi' && VIDEO_APIS.includes(pref.apiBase)
+        ? [pref.apiBase, ...VIDEO_APIS.filter(api => api !== pref.apiBase)]
+        : VIDEO_APIS;
+    return [
+        ...orderedMulti.map(apiBase => ({ kind: 'multi', apiBase })),
+        ...SHORTPLAY_APIS.map(apiBase => ({ kind: 'shortplay', apiBase })),
+    ];
+}
+
+function cacheResponseEntries(response) {
+    if (response?.data && typeof response.data === 'object') {
+        const now = Date.now();
+        for (const [id, entry] of Object.entries(response.data)) {
+            if (entry && (entry.video_model || entry.fallback_api)) {
+                entryCache.set(id, { entry, expires: now + 180000 });
+            }
+        }
+        while (entryCache.size > 64) {
+            entryCache.delete(entryCache.keys().next().value);
+        }
+    }
+}
+
+async function runPlaybackSteps(steps, vid, payload, device, execRequestJson, deadline, signal) {
+    const devKey = deviceKey(device);
+    let lastError = null;
+    let allEmpty = true;
+    let skipRemainingMulti = false;
+    let loggedMultiRetry = false;
+    let loggedShortplay = false;
+
+    for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        if (step.kind === 'multi' && skipRemainingMulti) continue;
+        signal.throwIfAborted();
+        if (deadline - Date.now() <= 0) break;
+
+        try {
+            if (step.kind === 'multi') {
+                const signed = playbackRequest(payload, device, step.apiBase);
+                const resp = await execRequestJson(signed.url, { method: 'POST', headers: signed.headers, data: signed.body }, deadline, signal);
+                if (Number(resp?.Code || resp?.code || 0) !== 0) {
+                    throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
+                }
+                cacheResponseEntries(resp);
+                const hasEntry = Boolean(resp?.data?.[vid] || entryCache.get(vid)?.entry);
+                if (hasEntry) setPreferredRoute(devKey, 'multi', step.apiBase);
+                return { response: resp, allEmpty: false };
+            }
+
+            const shortSigned = shortplayRequest(vid, device, step.apiBase);
+            const shortResp = await execRequestJson(shortSigned.url, { method: 'POST', headers: shortSigned.headers, data: shortSigned.body }, deadline, signal);
+            const entry = shortResp?.data?.[vid] || (shortResp?.data?.video_model ? shortResp.data : null);
+            if (entry) {
+                const resp = { code: 0, data: { [vid]: entry } };
+                cacheResponseEntries(resp);
+                setPreferredRoute(devKey, 'shortplay', step.apiBase);
+                return { response: resp, allEmpty: false };
+            }
+            allEmpty = false;
+        } catch (err) {
+            signal.throwIfAborted();
+            if (err.code === 'BUSINESS_REJECTED') throw err;
+            lastError = err;
+            if (err.code !== 'EMPTY_RESPONSE') {
+                allEmpty = false;
+                if (step.kind === 'multi') skipRemainingMulti = true;
+            }
+            const nextStep = steps.slice(i + 1).find(candidate => !(candidate.kind === 'multi' && skipRemainingMulti));
+            if (nextStep?.kind === 'multi' && err.code === 'EMPTY_RESPONSE' && !loggedMultiRetry) {
+                loggedMultiRetry = true;
+                logger.warn('AppSource', '播放接口返回空响应，尝试备用接口重试...');
+            } else if (nextStep?.kind === 'shortplay' && !loggedShortplay) {
+                loggedShortplay = true;
+                logger.warn('AppSource', '红果接口受阻，降级至番茄小说短剧备用通道...');
+            }
+        }
+    }
+    return { response: null, lastError, allEmpty };
+}
+
+function waitForInFlightEntry(job, signal) {
+    if (!signal) return job.promise;
+    if (signal.aborted) return Promise.reject(signal.reason);
+    const waiter = Symbol();
+    job.waiters.add(waiter);
+    return new Promise((resolve, reject) => {
+        const cleanup = () => {
+            signal.removeEventListener('abort', onAbort);
+            job.waiters.delete(waiter);
+        };
+        const onAbort = () => {
+            cleanup();
+            if (!job.waiters.size) job.controller.abort(signal.reason);
+            reject(signal.reason);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        job.promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    });
+}
+
+async function resolveUpstreamEntry(vid, batch, refresh, callerSignal) {
+    if (refresh) {
+        entryCache.delete(vid);
+        inFlightEntryRequests.delete(vid);
+    } else if (inFlightEntryRequests.has(vid)) {
+        return await waitForInFlightEntry(inFlightEntryRequests.get(vid), callerSignal);
+    }
+
+    const controller = new AbortController();
+    const timeoutSignal = AbortSignal.timeout(12000);
+    const internalSignal = AbortSignal.any([timeoutSignal, controller.signal]);
+    const deadline = Date.now() + 12000;
+
+    const job = { controller, waiters: new Set(), promise: null };
+    job.promise = (async () => {
+        const payload = JSON.stringify({
+            dr_scene: 'player',
+            biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
+            mixed_video_id_map: { '1004': batch },
+        });
+        const playbackId = crypto.randomUUID();
+        const execRequestJson = (url, requestOptions, ...args) => (module.exports.requestJson || requestJson)(url,
+            { ...requestOptions, diagnostics: { playback_id: playbackId, vid } }, ...args);
+        const device = await getPlaybackDevice(execRequestJson, internalSignal);
+        const steps = buildPlaybackSteps(deviceKey(device));
+        let result = await runPlaybackSteps(steps, vid, payload, device, execRequestJson, deadline, internalSignal);
+
+        if (!result.response && result.allEmpty && device?.created_at
+            && (Date.now() - device.created_at < FRESH_DEVICE_SYNC_WINDOW_MS)
+            && (deadline - Date.now() > FRESH_DEVICE_RETRY_DELAY_MS + 1000)) {
+            logger.info('AppSource', `新设备刚完成注册可能仍在跨集群同步中，等待 ${FRESH_DEVICE_RETRY_DELAY_MS}ms 后重试播放通道...`);
+            await sleepWithSignal(FRESH_DEVICE_RETRY_DELAY_MS, internalSignal);
+            const retrySteps = [
+                { kind: 'multi', apiBase: 'https://api5-normal-lq.fqnovel.com/novel/player/multi_video_model/player/v1' },
+                { kind: 'multi', apiBase: VIDEO_API },
+                { kind: 'shortplay', apiBase: SHORTPLAY_API },
+                { kind: 'shortplay', apiBase: 'https://api5-normal-lq.fqnovel.com/novel/player/video_model/v1/' },
+            ];
+            result = await runPlaybackSteps(retrySteps, vid, payload, device, execRequestJson, deadline, internalSignal);
+        }
+
+        if (!result.response) {
+            throw result.lastError || Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: 'MISSING_MODEL' });
+        }
+        const currentEntry = result.response.data?.[vid] || entryCache.get(vid)?.entry;
+        if (!currentEntry) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: 'MISSING_MODEL' });
+        return currentEntry;
+    })().finally(() => {
+        if (inFlightEntryRequests.get(vid) === job) inFlightEntryRequests.delete(vid);
+    });
+
+    inFlightEntryRequests.set(vid, job);
+    return await waitForInFlightEntry(job, callerSignal);
+}
+
 async function fetchAppPlayUrl(vid, options = {}) {
     const requestedQuality = normalizeDownloadQuality(options.quality);
     const allowLowerQuality = options.allowLowerQuality === true && requestedQuality !== 'auto';
@@ -481,13 +760,15 @@ async function fetchAppPlayUrl(vid, options = {}) {
     const timeoutSignal = AbortSignal.timeout(12000);
     const signal = options.signal ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal;
 
+    const allowHevc = options.allowHevc !== false;
+    const allowHevcTranscode = options.allowHevcTranscode === true;
     if (!options.refresh && entryCache.has(vid)) {
         const cached = entryCache.get(vid);
         if (cached?.expires > Date.now()) {
             try {
-                return await parseEntryPlayInfo(vid, cached.entry, requestedQuality, allowLowerQuality, deadline, signal, options.allowBytevc2 === true);
+                return await parseEntryPlayInfo(vid, cached.entry, requestedQuality, allowLowerQuality, deadline, signal, options.allowBytevc2 === true, allowHevc, allowHevcTranscode);
             } catch (error) {
-                if (error.code === 'UNSUPPORTED_BYTEVC2') throw error;
+                if (error.code === 'UNSUPPORTED_BYTEVC2' || error.code === 'UNSUPPORTED_HEVC') throw error;
                 entryCache.delete(vid);
             }
         } else {
@@ -505,74 +786,8 @@ async function fetchAppPlayUrl(vid, options = {}) {
         }
     }
 
-    const payload = JSON.stringify({
-        dr_scene: 'player',
-        biz_param: { detail_page_version: 0, device_level: 3, disable_digg_stat: false, need_all_video_definition: true, need_mp4_align: false, use_os_player: false, use_server_dns: false, video_platform: 1024 },
-        mixed_video_id_map: { '1004': batch },
-    });
-    const execRequestJson = (...args) => (module.exports.requestJson || requestJson)(...args);
-    const device = await getPlaybackDevice(execRequestJson, signal);
-    let signed = playbackRequest(payload, device, VIDEO_API);
-    let response;
-    try {
-        response = await execRequestJson(signed.url, { method: 'POST', headers: signed.headers, data: signed.body }, deadline, signal);
-    } catch (err) {
-        signal.throwIfAborted();
-        if (err.code === 'EMPTY_RESPONSE') {
-            logger.warn('AppSource', '播放接口返回空响应，尝试备用接口重试...');
-            signed = playbackRequest(payload, device, VIDEO_API_FALLBACK);
-            try {
-                response = await execRequestJson(signed.url, { method: 'POST', headers: signed.headers, data: signed.body }, deadline, signal);
-            } catch (fallbackErr) {
-                signal.throwIfAborted();
-                // 终极降级：尝试番茄小说客户端短剧接口 (aid: 1967)，使用同一个设备
-                try {
-                    logger.warn('AppSource', '红果接口受阻，降级至番茄小说短剧备用通道...');
-                    const shortSigned = shortplayRequest(vid, device);
-                    const shortResp = await execRequestJson(shortSigned.url, { method: 'POST', headers: shortSigned.headers, data: shortSigned.body }, deadline, signal);
-                    const entry = shortResp?.data?.[vid] || (shortResp?.data?.video_model ? shortResp.data : null);
-                    if (entry) {
-                        response = { code: 0, data: { [vid]: entry } };
-                    } else {
-                        throw fallbackErr;
-                    }
-                } catch (_) {
-                    throw fallbackErr;
-                }
-            }
-        } else {
-            // 其他网络错误时，尝试番茄小说客户端短剧接口
-            try {
-                const shortSigned = shortplayRequest(vid, device);
-                const shortResp = await execRequestJson(shortSigned.url, { method: 'POST', headers: shortSigned.headers, data: shortSigned.body }, deadline, signal);
-                const entry = shortResp?.data?.[vid] || (shortResp?.data?.video_model ? shortResp.data : null);
-                if (entry) {
-                    response = { code: 0, data: { [vid]: entry } };
-                } else {
-                    throw err;
-                }
-            } catch (_) {
-                throw err;
-            }
-        }
-    }
-    if (Number(response.Code || response.code || 0) !== 0) throw Object.assign(new Error('App 接口暂未提供本集播放信息'), { code: 'BUSINESS_REJECTED' });
-
-    if (response.data && typeof response.data === 'object') {
-        const now = Date.now();
-        for (const [id, entry] of Object.entries(response.data)) {
-            if (entry && (entry.video_model || entry.fallback_api)) {
-                entryCache.set(id, { entry, expires: now + 180000 });
-            }
-        }
-        while (entryCache.size > 64) {
-            entryCache.delete(entryCache.keys().next().value);
-        }
-    }
-
-    const currentEntry = response.data?.[vid] || entryCache.get(vid)?.entry;
-    if (!currentEntry) throw Object.assign(new Error('App 接口未返回所选分集，已停止取址'), { code: 'MISSING_MODEL' });
-    return await parseEntryPlayInfo(vid, currentEntry, requestedQuality, allowLowerQuality, deadline, signal, options.allowBytevc2 === true);
+    const currentEntry = await resolveUpstreamEntry(vid, batch, options.refresh === true, signal);
+    return await parseEntryPlayInfo(vid, currentEntry, requestedQuality, allowLowerQuality, deadline, signal, options.allowBytevc2 === true, allowHevc, allowHevcTranscode);
 }
 
-module.exports = { fetchAppPlayUrl, clearEntryCache, signedSearchRequest, signedMetadataRequest, parseSearchInteger, requestJson, playbackRequest, shortplayRequest, SEARCH_API, SEARCH_UA };
+module.exports = { fetchAppPlayUrl, clearEntryCache, isHevcCodec, signedSearchRequest, signedMetadataRequest, parseSearchInteger, requestJson, playbackRequest, shortplayRequest, SEARCH_API, SEARCH_UA };
