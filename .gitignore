@@ -12,3 +12,6 @@ data/*.bak
 # 本地审计与审查记录
 /reviews/
 /docs/review-implementation.md
+.omc/
+.workbuddy-ai/
+release/
