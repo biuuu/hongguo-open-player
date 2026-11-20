@@ -214,6 +214,46 @@ test('fetchAppPlayUrl falls back across multi_video_model clusters before fallin
 });
 
 
+test('fetchAppPlayUrl falls back to video_tab GET when every POST player endpoint is empty', async () => {
+  const originalRequest = appSource.requestJson;
+  appSource.clearEntryCache();
+  const urls = [];
+  let tabCalls = 0;
+
+  appSource.requestJson = async (url, options) => {
+    if (url.includes('register')) {
+      return { code: 0, device_id_str: '999', install_id_str: '888' };
+    }
+    urls.push({ url, method: options?.method });
+    if (url.includes('/reading/bookapi/video_tab/multi_video_model/v1/')) {
+      tabCalls++;
+      assert.equal(options?.method, 'GET', 'video_tab fallback must be a GET request');
+      assert.ok(!options?.data, 'video_tab fallback must not carry a body');
+      assert.ok(url.includes('video_id=30001'), 'video_tab must bind the requested episode');
+      assert.ok(url.includes('device_id=999'), 'video_tab must reuse the same registered device');
+      return {
+        code: 0,
+        data: { video_model_data: { '30001': mockEntry('30001') } },
+      };
+    }
+    // Every POST player + shortplay cluster returns an empty HTTP 200 body.
+    throw Object.assign(new Error('App upstream returned empty response'), { code: 'EMPTY_RESPONSE' });
+  };
+
+  try {
+    const play = await appSource.fetchAppPlayUrl('30001');
+    assert.equal(play.url, 'https://qznovelvod.com/video_30001.mp4');
+    assert.ok(tabCalls >= 1, 'video_tab fallback should have been attempted');
+    const tabIndex = urls.findIndex(entry => entry.url.includes('/reading/bookapi/video_tab/'));
+    assert.ok(tabIndex > 0, 'video_tab must be tried after the POST player endpoints');
+    assert.ok(urls.slice(0, tabIndex).every(entry => entry.method === 'POST'));
+  } finally {
+    appSource.requestJson = originalRequest;
+    appSource.clearEntryCache();
+  }
+});
+
+
 test('fetchAppPlayUrl selects highest resolution when multiple streams of different definitions exist', async () => {
   const originalRequest = appSource.requestJson;
   appSource.clearEntryCache();

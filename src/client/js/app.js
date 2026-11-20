@@ -519,11 +519,13 @@ const app = createApp({
       isControlsHidden.value = hidden;
       if (typeof document !== 'undefined' && document.body?.classList) {
         document.body.classList.toggle('hide-cursor', Boolean(hidden && isFullscreen.value));
+        // 剧场模式（含非全屏）隐藏控件时同步切换沉浸式布局：移除上下栏占位，让画面铺满窗口
+        document.body.classList.toggle('theater-immersive', Boolean(hidden && viewMode.value === 'theater'));
       }
     }
 
     function handleWindowMouseMove() {
-      if (isFullscreen.value && isControlsHidden.value) {
+      if (viewMode.value === 'theater' && isControlsHidden.value) {
         resetControlsTimer();
       }
     }
@@ -537,13 +539,32 @@ const app = createApp({
         setControlsHidden(false);
       }
       clearTimeout(controlsHideTimer);
-      if (isFullscreen.value && isPlaying.value && !isScrubbing.value) {
+      // 全屏与剧场模式都启用空闲自动隐藏；暂停、拖动进度条时不隐藏
+      if (viewMode.value === 'theater' && isPlaying.value && !isScrubbing.value) {
         controlsHideTimer = setTimeout(() => {
-          if (isFullscreen.value && isPlaying.value && !isScrubbing.value) {
+          if (viewMode.value === 'theater' && isPlaying.value && !isScrubbing.value) {
             setControlsHidden(true);
           }
         }, 2500);
       }
+    }
+
+    // 窗口失焦或页面切到后台：立即隐藏上下栏，避免画面被固定条占据。
+    // 重新聚焦不立刻弹出控件，待鼠标移动或按键后再恢复，保持画面完整。
+    function handleWindowBlur() {
+      if (viewMode.value !== 'theater' || !isPlaying.value || isScrubbing.value) return;
+      clearTimeout(controlsHideTimer);
+      setControlsHidden(true);
+    }
+
+    function handleWindowFocus() {
+      if (viewMode.value !== 'theater' || !isScrubbing.value) return;
+      setControlsHidden(false);
+      resetControlsTimer();
+    }
+
+    function handleVisibilityChange() {
+      if (document.hidden) handleWindowBlur();
     }
     function previewSeek(event) {
       const rect = event.currentTarget.getBoundingClientRect();
@@ -2062,6 +2083,9 @@ const app = createApp({
       window.addEventListener('keydown', handleKeyDown);
       window.addEventListener('click', handleGlobalClick);
       window.addEventListener('mousemove', handleWindowMouseMove);
+      window.addEventListener('blur', handleWindowBlur);
+      window.addEventListener('focus', handleWindowFocus);
+      document.addEventListener?.('visibilitychange', handleVisibilityChange);
       document.addEventListener?.('pointerdown', handleGlobalPointerDown, true);
       document.addEventListener?.('focusin', handleGlobalFocusIn);
       window.addEventListener('pagehide', saveProgressNow);
@@ -2086,6 +2110,9 @@ const app = createApp({
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('click', handleGlobalClick);
       window.removeEventListener('mousemove', handleWindowMouseMove);
+      window.removeEventListener('blur', handleWindowBlur);
+      window.removeEventListener('focus', handleWindowFocus);
+      document.removeEventListener?.('visibilitychange', handleVisibilityChange);
       document.removeEventListener?.('pointerdown', handleGlobalPointerDown, true);
       document.removeEventListener?.('focusin', handleGlobalFocusIn);
       window.removeEventListener('pagehide', saveProgressNow);
@@ -2103,6 +2130,7 @@ const app = createApp({
       savePreferences, danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuSpeed, danmakuLikesPriority, toggleLikesPriority, prioritizeDanmakuItems, estimateDanmakuWidth, calculateRequiredGap, danmakuStatus, danmakuLayer, danmakuColor, toggleDanmaku, loadDanmaku,
       toastText, osdMessage, sidebarOpen, isScrubbing, previewTime, previewPercent, showPreview,
       isFullscreen, isControlsHidden, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove,
+      handleWindowBlur, handleWindowFocus,
       previewSeek, seekFromSlider, startScrubbing, finishScrubbing,
       viewMode,
       currentTab,

@@ -32,6 +32,13 @@ const SHORTPLAY_APIS = [
     'https://api5-normal-lq.fqnovel.com/novel/player/video_model/v1/',
     'https://reading.snssdk.com/novel/player/video_model/v1/',
 ];
+// video_tab is a GET fallback used by upstream when the POST player endpoint
+// intermittently returns HTTP 200 with an empty body (hongguoTV 0.16.10, 2026-11-19).
+const TAB_APIS = [
+    'https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/',
+    'https://api5-normal-hl.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/',
+    'https://api5-normal-lf.fqnovel.com/reading/bookapi/video_tab/multi_video_model/v1/',
+];
 const SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
 const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
 const PLAYBACK_UA = 'com.phoenix.read/74332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
@@ -173,6 +180,31 @@ function playbackRequest(payload, identity, apiBase = VIDEO_API) {
     };
     // The transport supplies cookies scoped to the destination from the active session.
     return { url, body, headers };
+}
+
+// GET video_tab fallback. Uses the same registered identity and v5 signature
+// as the POST player request, with the profile override required by upstream
+// and the per-episode extra parameters from GetVideoModelRequest.
+function tabRequest(vid, identity, apiBase = TAB_APIS[0]) {
+    const { device_id, iid, cdid } = identity || {};
+    const values = {
+        ...V5_PLAYBACK_QUERY,
+        version_code: '73932', version_name: '7.3.9.32',
+        manifest_version_code: '73932', update_version_code: '73932', pv_player: '73932',
+        iid: iid || '', cdid: cdid || '', device_id: device_id || '',
+        video_id: String(vid), video_id_type: '0', device_level: '1',
+        need_all_video_definition: '1', need_mp4_align: '0', use_os_player: '0',
+        video_platform: '1024', source: '0', from_video_id: '',
+    };
+    const { url, headers: signedHeaders } = signPlaybackV5(apiBase, values, null);
+    return {
+        url,
+        headers: {
+            'User-Agent': V5_PLAYBACK_UA,
+            Accept: 'application/json; charset=utf-8',
+            ...signedHeaders,
+        },
+    };
 }
 
 function shortplayRequest(vid, identity, apiBase = SHORTPLAY_API) {
@@ -589,18 +621,26 @@ function setPreferredRoute(devKey, kind, apiBase) {
     preferredRouteByDevice.delete(devKey);
     preferredRouteByDevice.set(devKey, kind === 'shortplay'
         ? { kind, apiBase, expires: Date.now() + SHORTPLAY_PREF_TTL_MS }
-        : { kind, apiBase });
+        : kind === 'tab'
+            ? { kind, apiBase, expires: Date.now() + TAB_PREF_TTL_MS }
+            : { kind, apiBase });
     while (preferredRouteByDevice.size > 32) {
         preferredRouteByDevice.delete(preferredRouteByDevice.keys().next().value);
     }
 }
 
+const TAB_PREF_TTL_MS = 10 * 60 * 1000;
+
 function buildPlaybackSteps(devKey) {
+    const tabSteps = TAB_APIS.map(apiBase => ({ kind: 'tab', apiBase }));
     const pref = getPreferredRoute(devKey);
+    if (pref?.kind === 'tab' && TAB_APIS.includes(pref.apiBase)) {
+        return [{ kind: 'tab', apiBase: pref.apiBase }, ...tabSteps.filter(s => s.apiBase !== pref.apiBase)];
+    }
     if (pref?.kind === 'shortplay') {
         const restShortplay = SHORTPLAY_APIS.filter(api => api !== pref.apiBase).map(apiBase => ({ kind: 'shortplay', apiBase }));
         const multiSteps = VIDEO_APIS.map(apiBase => ({ kind: 'multi', apiBase }));
-        return [{ kind: 'shortplay', apiBase: pref.apiBase }, ...multiSteps, ...restShortplay];
+        return [{ kind: 'shortplay', apiBase: pref.apiBase }, ...multiSteps, ...restShortplay, ...tabSteps];
     }
     const orderedMulti = pref?.kind === 'multi' && VIDEO_APIS.includes(pref.apiBase)
         ? [pref.apiBase, ...VIDEO_APIS.filter(api => api !== pref.apiBase)]
@@ -608,6 +648,7 @@ function buildPlaybackSteps(devKey) {
     return [
         ...orderedMulti.map(apiBase => ({ kind: 'multi', apiBase })),
         ...SHORTPLAY_APIS.map(apiBase => ({ kind: 'shortplay', apiBase })),
+        ...tabSteps,
     ];
 }
 
@@ -650,6 +691,23 @@ async function runPlaybackSteps(steps, vid, payload, device, execRequestJson, de
                 const hasEntry = Boolean(resp?.data?.[vid] || entryCache.get(vid)?.entry);
                 if (hasEntry) setPreferredRoute(devKey, 'multi', step.apiBase);
                 return { response: resp, allEmpty: false };
+            }
+
+            if (step.kind === 'tab') {
+                const signed = tabRequest(vid, device, step.apiBase);
+                const resp = await execRequestJson(signed.url, { method: 'GET', headers: signed.headers }, deadline, signal);
+                if (Number(resp?.Code || resp?.code || 0) !== 0) continue;
+                // video_tab returns data.video_model_data[vid].video_model; normalize to
+                // the same shape as the POST player response so downstream parsing is shared.
+                const rows = resp?.data?.video_model_data || resp?.data || {};
+                const row = rows[vid];
+                const rawModel = row?.video_model;
+                const model = typeof rawModel === 'string' ? jsonBody(rawModel) : rawModel;
+                if (!model || !Array.isArray(model.video_list) || model.video_list.length === 0) continue;
+                const normalized = { code: 0, data: { [vid]: { video_model: model } } };
+                cacheResponseEntries(normalized);
+                setPreferredRoute(devKey, 'tab', step.apiBase);
+                return { response: normalized, allEmpty: false };
             }
 
             const shortSigned = shortplayRequest(vid, device, step.apiBase);
