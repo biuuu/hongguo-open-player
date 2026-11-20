@@ -1,6 +1,9 @@
 node_modules/
 dist/
 dist-electron/
+dist-portable-*/
+dist-pkg-*/
+release/
 build/bytevc2/
 data/*.json
 data/*.bak
@@ -15,3 +18,4 @@ data/*.bak
 .omc/
 .workbuddy-ai/
 release/
+.vscode

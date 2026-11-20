@@ -1649,6 +1649,51 @@ body.hide-cursor * {
   pointer-events: none;
 }
 
+/* 剧场模式空闲/失焦沉浸布局（含非全屏）：移除导航条与上下控制条占位，画面铺满整个窗口。
+   控件淡出动画由上面的 .controls-hidden 规则负责，这里只负责释放布局空间。 */
+body.theater-immersive .app-header {
+  display: none;
+}
+
+body.theater-immersive .theater-view {
+  top: 0;
+  height: 100vh;
+}
+
+body.theater-immersive .player-container .player-header,
+body.theater-immersive .player-container .player-controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: 20;
+  transition: opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1), transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+body.theater-immersive .player-container .player-header {
+  top: 0;
+  height: auto;
+  min-height: 54px;
+  padding: 12px 28px;
+  border-bottom: none;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.85) 0%, rgba(0, 0, 0, 0.35) 60%, transparent 100%);
+}
+
+body.theater-immersive .player-container .player-controls {
+  bottom: 0;
+  height: auto;
+  padding: 16px 28px 20px 28px;
+  border-top: none;
+  background: linear-gradient(0deg, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.55) 60%, transparent 100%);
+}
+
+body.theater-immersive .player-container .video-stage {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+}
+
 .theater-sidebar { flex-shrink: 0; }
 html.platform-win .app-header { padding-right: 160px; }
 
