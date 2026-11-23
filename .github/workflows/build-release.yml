@@ -184,12 +184,12 @@ jobs:
         with:
           tag_name: ${{ needs.prep.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: "红果开源播放器 Windows 原生桌面版 ${{ needs.prep.outputs.tag }}"
+          name: "红果播放器 Plus Windows 原生桌面版 ${{ needs.prep.outputs.tag }}"
           draft: false
           prerelease: false
           generate_release_notes: true
           body: |
-            ### 🎬 红果开源播放器 Windows 原生桌面版 ${{ needs.prep.outputs.tag }}
+            ### 🎬 红果播放器 Plus Windows 原生桌面版 ${{ needs.prep.outputs.tag }}
 
             Windows 原生桌面应用，开箱即用，无需打开任何网页浏览器。
 
@@ -202,8 +202,8 @@ jobs:
 
             #### 📥 下载安装方式：
             - **Windows (x64)**：
-              - 安装向导版：下载 `hongguo-open-player-*-win-x64-setup.exe`，双击根据向导安装，自动创建桌面与开始菜单快捷方式。
-              - 单文件便携版：下载 `hongguo-open-player-*-win-x64-portable.exe`，双击直接运行。
-              - 绿色免安装 ZIP：下载 `hongguo-open-player-*-win-x64.zip`，解压后双击 `红果开源播放器.exe` 直接运行。
+              - 安装向导版：下载 `hongguo-player-plus-*-win-x64-setup.exe`，双击根据向导安装，自动创建桌面与开始菜单快捷方式。
+              - 单文件便携版：下载 `hongguo-player-plus-*-win-x64-portable.exe`，双击直接运行。
+              - 绿色免安装 ZIP：下载 `hongguo-player-plus-*-win-x64.zip`，解压后双击 `红果播放器 Plus.exe` 直接运行。
           files: |
             release-assets/*

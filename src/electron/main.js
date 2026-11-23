@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-const { app, BrowserWindow, WebContentsView, ipcMain, Menu, shell, dialog, screen } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, Menu, shell, dialog, screen, globalShortcut } = require('electron');
 const path = require('path');
 const { MIN_WIDTH, MIN_HEIGHT, readBounds, fitBounds, writeBounds } = require('./miniWindowBounds');
 
@@ -91,6 +91,83 @@ ipcMain.handle('set-mini-mode', (event, enabled) => {
   setMiniMode(enabled);
 });
 
+// ================= 桌面设置：老板键（全局快捷键隐藏 / 显示窗口） =================
+let bossKeyConfig = null;
+let bossKeyRegistered = null;
+
+function desktopSettingsPath() {
+  const storageRoot = app.isPackaged ? app.getPath('userData') : path.join(__dirname, '../..');
+  return path.join(storageRoot, 'data', 'desktop-settings.json');
+}
+
+function loadDesktopSettings() {
+  try {
+    bossKeyConfig = JSON.parse(require('node:fs').readFileSync(desktopSettingsPath(), 'utf8')).bossKey || null;
+  } catch (_) {
+    bossKeyConfig = null;
+  }
+}
+
+function saveDesktopSettings() {
+  try {
+    const file = desktopSettingsPath();
+    require('node:fs').mkdirSync(path.dirname(file), { recursive: true });
+    require('node:fs').writeFileSync(file, JSON.stringify({ bossKey: bossKeyConfig }, null, 2));
+  } catch (_) {}
+}
+
+function toggleMainWindowVisibility() {
+  const win = miniWindow && !miniWindow.isDestroyed() ? miniWindow : mainWindow;
+  if (!win || win.isDestroyed()) return;
+  if (win.isVisible() && !win.isMinimized()) {
+    win.hide();
+  } else {
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  }
+}
+
+function applyBossKey(accelerator) {
+  if (!accelerator) {
+    if (bossKeyRegistered) globalShortcut.unregister(bossKeyRegistered);
+    bossKeyRegistered = null;
+    bossKeyConfig = null;
+    saveDesktopSettings();
+    return { success: true, bossKey: null };
+  }
+  if (accelerator === bossKeyRegistered) return { success: true, bossKey: accelerator };
+  try {
+    if (globalShortcut.register(accelerator, toggleMainWindowVisibility)) {
+      if (bossKeyRegistered) globalShortcut.unregister(bossKeyRegistered);
+      bossKeyRegistered = accelerator;
+      bossKeyConfig = accelerator;
+      saveDesktopSettings();
+      return { success: true, bossKey: accelerator };
+    }
+    return { success: false, error: '该快捷键可能已被其他程序占用，请换一个组合键' };
+  } catch (_) {
+    return { success: false, error: '快捷键格式无效，请重新录制' };
+  }
+}
+
+function setupDesktopSettingsIpc() {
+  const checkSender = event => {
+    if (!playerView || event.sender !== playerView.webContents || event.senderFrame !== playerView.webContents.mainFrame) {
+      throw new Error('无效的桌面设置请求');
+    }
+  };
+  ipcMain.handle('settings:get', event => {
+    checkSender(event);
+    return { bossKey: bossKeyConfig };
+  });
+  ipcMain.handle('settings:setBossKey', (event, accelerator) => {
+    checkSender(event);
+    const acc = typeof accelerator === 'string' && accelerator.trim() ? accelerator.trim() : null;
+    return applyBossKey(acc);
+  });
+}
+
 function createWindow() {
   if (mainWindow) { (miniWindow || mainWindow).focus(); return Promise.resolve(); }
   windowCreation ||= buildWindow().catch(error => {
@@ -106,8 +183,10 @@ async function buildWindow() {
   if (app.isPackaged === false && !process.env.HONGGUO_BVC2_FFMPEG) {
     process.env.HONGGUO_BVC2_FFMPEG = path.join(__dirname, '../../build/bytevc2', process.arch, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg');
   }
-  process.env.HONGGUO_DATA_DIR = path.join(app.getPath('userData'), 'data');
-  process.env.HONGGUO_LOG_DIR = path.join(app.getPath('userData'), 'logs');
+  // 开发模式下数据与日志存放在项目目录（与 npm start 共用，git 已忽略）；打包版仍用 userData，避免写入安装目录
+  const storageRoot = app.isPackaged ? app.getPath('userData') : path.join(__dirname, '../..');
+  process.env.HONGGUO_DATA_DIR = path.join(storageRoot, 'data');
+  process.env.HONGGUO_LOG_DIR = path.join(storageRoot, 'logs');
   let logger;
   try {
     logger = require('../server/services/logger');
@@ -116,7 +195,7 @@ async function buildWindow() {
   }
   logger.info('Electron', `正在启动原生客户端: 架构=${process.arch}, 平台=${process.platform}, 版本=${typeof app.getVersion === 'function' ? app.getVersion() : 'dev'}`);
   const { startServer } = require('../server/index.js');
-  serverStart ||= startServer(8899).catch(error => { serverStart = null; throw error; });
+  serverStart ||= startServer(8900).catch(error => { serverStart = null; throw error; });
   const res = await serverStart;
   serverInstance = res.server;
   const port = res.port;
@@ -128,7 +207,7 @@ async function buildWindow() {
     height: 840,
     minWidth: 960,
     minHeight: 640,
-    title: '红果开源播放器',
+    title: '红果播放器',
     backgroundColor: '#0f1015',
     autoHideMenuBar: !isMac, // Windows 下默认隐藏传统菜单栏，保持纯粹现代深色观影质感 (按 Alt 唤出)
     show: false // 待内容准备完毕后再优雅显示，避免白屏
@@ -199,6 +278,11 @@ async function buildWindow() {
     }
   });
   window.on('closed', () => {
+    if (miniWindow && !miniWindow.isDestroyed()) {
+      saveMiniBounds(miniWindow);
+      miniWindow.destroy();
+      miniWindow = null;
+    }
     if (mainWindow === window) mainWindow = null;
     if (playerView === view) playerView = null;
     if (!view.webContents.isDestroyed()) view.webContents.close();
@@ -232,8 +316,8 @@ function showAboutDialog() {
 
   dialog.showMessageBox(mainWindow || undefined, {
     type: 'info',
-    title: '关于 红果开源播放器',
-    message: `红果开源播放器 v${version}`,
+    title: '关于 红果播放器 Plus',
+    message: `红果播放器 Plus v${version}`,
     detail: `一款优雅、无广告的开源跨平台红果短剧播放器。\n\n项目开源主页: ${GITHUB_REPO_URL}\n开源许可: GPL-3.0`,
     buttons: ['访问 GitHub 主页', '确定'],
     defaultId: 0,
@@ -254,28 +338,28 @@ function setupMenu() {
     ...(isMac
       ? [
           {
-            label: '红果开源播放器',
+            label: '红果播放器 Plus',
             submenu: [
               {
-                label: '关于 红果开源播放器',
+                label: '关于 红果播放器 Plus',
                 click: () => showAboutDialog()
               },
               {
                 label: '生成新的设备 ID',
                 click: () => {
                   if (mainWindow && !mainWindow.isDestroyed()) {
-                    mainWindow.webContents.executeJavaScript('window.__app?.resetDevice?.()').catch(console.error);
+                    playerView?.webContents.executeJavaScript('window.__app?.resetDevice?.()').catch(console.error);
                   }
                 }
               },
               { type: 'separator' },
               { role: 'services', label: '服务' },
               { type: 'separator' },
-              { role: 'hide', label: '隐藏 红果开源播放器' },
+              { role: 'hide', label: '隐藏 红果播放器 Plus' },
               { role: 'hideOthers', label: '隐藏其他' },
               { role: 'unhide', label: '全部显示' },
               { type: 'separator' },
-              { role: 'quit', label: '退出 红果开源播放器' }
+              { role: 'quit', label: '退出 红果播放器 Plus' }
             ]
           }
         ]
@@ -330,14 +414,14 @@ function setupMenu() {
       label: '帮助',
       submenu: [
         {
-          label: '关于 红果开源播放器',
+          label: '关于 红果播放器 Plus',
           click: () => showAboutDialog()
         },
         {
           label: '生成新的设备 ID',
           click: () => {
             if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.executeJavaScript('window.__app?.resetDevice?.()').catch(console.error);
+              playerView?.webContents.executeJavaScript('window.__app?.resetDevice?.()').catch(console.error);
             }
           }
         },
@@ -384,6 +468,7 @@ if (!gotTheLock) {
     if (mainWindow) {
       const window = miniWindow || mainWindow;
       if (window.isMinimized()) window.restore();
+      if (!window.isVisible()) window.show();
       window.focus();
     }
   });
@@ -394,7 +479,7 @@ if (!gotTheLock) {
     }
     if (typeof app.setAboutPanelOptions === 'function') {
       app.setAboutPanelOptions({
-        applicationName: '红果开源播放器',
+        applicationName: '红果播放器 Plus',
         applicationVersion: typeof app.getVersion === 'function' ? app.getVersion() : '1.0.0',
         copyright: 'Copyright © 2026 zfdang. Licensed under GPL-3.0.',
         website: GITHUB_REPO_URL,
@@ -402,6 +487,14 @@ if (!gotTheLock) {
       });
     }
     setupMenu();
+    // 桌面设置：加载并注册老板键，暴露 IPC
+    loadDesktopSettings();
+    setupDesktopSettingsIpc();
+    if (bossKeyConfig) {
+      const savedBossKey = bossKeyConfig;
+      bossKeyConfig = null;
+      applyBossKey(savedBossKey);
+    }
     createWindow().catch((err) => {
       console.error('Failed to create window:', err);
     });
@@ -418,6 +511,11 @@ if (!gotTheLock) {
     if (process.platform !== 'darwin') {
       app.quit();
     }
+  });
+
+  // 退出前释放全局快捷键
+  app.on('will-quit', () => {
+    try { globalShortcut.unregisterAll(); } catch (_) {}
   });
 
   app.on('before-quit', event => {

@@ -9,3 +9,7 @@ contextBridge.exposeInMainWorld('desktopPlayer', {
     return () => ipcRenderer.removeListener('mini-mode-restored', handler);
   }
 });
+contextBridge.exposeInMainWorld('hongguoDesktop', {
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  setBossKey: (accelerator) => ipcRenderer.invoke('settings:setBossKey', accelerator)
+});
