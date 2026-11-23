@@ -542,8 +542,6 @@ const app = createApp({
       isControlsHidden.value = hidden;
       if (typeof document !== 'undefined' && document.body?.classList) {
         document.body.classList.toggle('hide-cursor', Boolean(hidden && isFullscreen.value));
-        // 剧场模式（含非全屏）隐藏控件时同步切换沉浸式布局：移除上下栏占位，让画面铺满窗口
-        document.body.classList.toggle('theater-immersive', Boolean(hidden && viewMode.value === 'theater' && !isMiniMode.value));
       }
     }
 
@@ -567,7 +565,7 @@ const app = createApp({
       if (isMiniMode.value) {
         if (event) miniControlsHovered = isPointerOverMiniControls(event);
         resetControlsTimer();
-      } else if ((isFullscreen.value || viewMode.value === 'theater') && isControlsHidden.value) {
+      } else if (isFullscreen.value && isControlsHidden.value) {
         resetControlsTimer();
       }
     }
@@ -581,9 +579,9 @@ const app = createApp({
         setControlsHidden(false);
       }
       clearTimeout(controlsHideTimer);
-      if ((isMiniMode.value || ((isFullscreen.value || viewMode.value === 'theater') && isPlaying.value)) && !isScrubbing.value && !volumeDragging && !(isMiniMode.value && miniControlsHovered)) {
+      if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging && !(isMiniMode.value && miniControlsHovered)) {
         controlsHideTimer = setTimeout(() => {
-          if ((isMiniMode.value || ((isFullscreen.value || viewMode.value === 'theater') && isPlaying.value)) && !isScrubbing.value && !volumeDragging && !(isMiniMode.value && miniControlsHovered)) {
+          if ((isMiniMode.value || (isFullscreen.value && isPlaying.value)) && !isScrubbing.value && !volumeDragging && !(isMiniMode.value && miniControlsHovered)) {
             setControlsHidden(true);
           }
         }, isMiniMode.value ? 1000 : 2500);
@@ -646,24 +644,6 @@ const app = createApp({
         miniModeChanging = false;
       }
     }
-
-    // 窗口失焦或页面切到后台：立即隐藏上下栏，避免画面被固定条占据。
-    // 重新聚焦不立刻弹出控件，待鼠标移动或按键后再恢复，保持画面完整。
-    function handleWindowBlur() {
-      if (viewMode.value !== 'theater' || isMiniMode.value || !isPlaying.value || isScrubbing.value) return;
-      clearTimeout(controlsHideTimer);
-      setControlsHidden(true);
-    }
-
-    function handleWindowFocus() {
-      if (viewMode.value !== 'theater' || !isScrubbing.value) return;
-      setControlsHidden(false);
-      resetControlsTimer();
-    }
-
-    function handleVisibilityChange() {
-      if (document.hidden) handleWindowBlur();
-    }
     function previewSeek(event) {
       const rect = event.currentTarget.getBoundingClientRect();
       const fraction = rect.width ? Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) : 0;
@@ -710,7 +690,7 @@ const app = createApp({
         fullscreenExitAt = Date.now();
         setControlsHidden(false);
         clearTimeout(controlsHideTimer);
-        if (isMiniMode.value || viewMode.value === 'theater') resetControlsTimer();
+        if (isMiniMode.value) resetControlsTimer();
       } else {
         resetControlsTimer();
       }
@@ -2187,9 +2167,6 @@ const app = createApp({
       window.addEventListener('keydown', handleKeyDown);
       window.addEventListener('click', handleGlobalClick);
       window.addEventListener('mousemove', handleWindowMouseMove);
-      window.addEventListener('blur', handleWindowBlur);
-      window.addEventListener('focus', handleWindowFocus);
-      document.addEventListener?.('visibilitychange', handleVisibilityChange);
       document.addEventListener?.('pointerdown', handleGlobalPointerDown, true);
       document.addEventListener?.('focusin', handleGlobalFocusIn);
       window.addEventListener('pagehide', saveProgressNow);
@@ -2224,9 +2201,6 @@ const app = createApp({
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('click', handleGlobalClick);
       window.removeEventListener('mousemove', handleWindowMouseMove);
-      window.removeEventListener('blur', handleWindowBlur);
-      window.removeEventListener('focus', handleWindowFocus);
-      document.removeEventListener?.('visibilitychange', handleVisibilityChange);
       document.removeEventListener?.('pointerdown', handleGlobalPointerDown, true);
       document.removeEventListener?.('focusin', handleGlobalFocusIn);
       window.removeEventListener('pagehide', saveProgressNow);
@@ -2245,7 +2219,6 @@ const app = createApp({
       savePreferences, danmakuEnabled, showDanmakuSettings, danmakuRows, danmakuOpacity, danmakuSpeed, danmakuLikesPriority, danmakuMergeInterval, setDanmakuMergeInterval, toggleLikesPriority, prioritizeDanmakuItems, estimateDanmakuWidth, calculateRequiredGap, danmakuStatus, danmakuLayer, danmakuColor, toggleDanmaku, loadDanmaku,
       toastText, osdMessage, sidebarOpen, isScrubbing, previewTime, previewPercent, showPreview,
       isFullscreen, isMiniMode, miniModeAvailable, toggleMiniMode, isControlsHidden, playerControlsEl, miniRestoreBtnEl, resetControlsTimer, clearControlsTimer, setControlsHidden, handleWindowMouseMove, handleControlsPointerEnter, handleControlsPointerLeave, holdControls, releaseControls,
-      handleWindowBlur, handleWindowFocus,
       previewSeek, seekFromSlider, startScrubbing, finishScrubbing,
       viewMode,
       currentTab,

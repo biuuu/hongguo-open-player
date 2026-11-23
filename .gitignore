@@ -1,9 +1,6 @@
 node_modules/
 dist/
 dist-electron/
-dist-portable-*/
-dist-pkg-*/
-release/
 build/bytevc2/
 data/*.json
 data/*.bak
@@ -15,7 +12,3 @@ data/*.bak
 # 本地审计与审查记录
 /reviews/
 /docs/review-implementation.md
-.omc/
-.workbuddy-ai/
-release/
-.vscode

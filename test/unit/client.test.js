@@ -675,8 +675,7 @@ test('fullscreen auto-hide: controls hide when idle while playing, awaken on int
   assert.equal(state.isControlsHidden.value, false);
   assert.equal(bodyClasses.has('hide-cursor'), false);
 
-  // 1. Enter fullscreen while playing (theater view is the gate for auto-hide)
-  state.viewMode.value = 'theater';
+  // 1. Enter fullscreen while playing
   state.isFullscreen.value = true;
   state.isPlaying.value = true;
   state.resetControlsTimer();
@@ -690,13 +689,11 @@ test('fullscreen auto-hide: controls hide when idle while playing, awaken on int
   timerFn();
   assert.equal(state.isControlsHidden.value, true, 'Controls should hide after timer fires');
   assert.equal(bodyClasses.has('hide-cursor'), true, 'Body must have hide-cursor class');
-  assert.equal(bodyClasses.has('theater-immersive'), true, 'Immersive layout must release header/controls space');
 
   // 2. User moves mouse / interacts -> resetControlsTimer awakens controls and restores cursor immediately
   state.resetControlsTimer();
   assert.equal(state.isControlsHidden.value, false, 'Controls should awaken on user interaction');
   assert.equal(bodyClasses.has('hide-cursor'), false, 'hide-cursor must be removed on user interaction');
-  assert.equal(bodyClasses.has('theater-immersive'), false, 'Immersive layout must be removed on interaction');
 
   // Fire timer again
   state.resetControlsTimer();
@@ -980,107 +977,6 @@ test('mini mode keeps hidden controls hidden through automatic episode transitio
   state.isFullscreen.value = true;
   state.onPlay({ target: newVideo });
   assert.equal(state.isControlsHidden.value, false);
-});
-
-test('window blur hides theater chrome immediately and immersive layout is removed on interaction', () => {
-  let timerFn = null;
-  let timerMs = 0;
-  const bodyClasses = new Set();
-  const state = client(async () => response([]), {
-    setTimeout: (fn, ms) => { timerFn = fn; timerMs = ms; return 1; },
-    clearTimeout() { timerFn = null; },
-    document: {
-      fullscreenElement: null,
-      hidden: false,
-      documentElement: { classList: { add() {} } },
-      body: { classList: {
-        add: cls => bodyClasses.add(cls),
-        remove: cls => bodyClasses.delete(cls),
-        toggle: (cls, val) => { if (val) bodyClasses.add(cls); else bodyClasses.delete(cls); },
-        contains: cls => bodyClasses.has(cls)
-      } },
-      addEventListener() {}, removeEventListener() {}
-    }
-  });
-
-  state.viewMode.value = 'theater';
-  state.isPlaying.value = true;
-  state.isFullscreen.value = false;
-
-  // Non-fullscreen theater playback also arms the idle-hide timer.
-  state.resetControlsTimer();
-  assert.equal(timerMs, 2500);
-  assert.ok(typeof timerFn === 'function');
-
-  // Losing focus hides immediately without waiting for the idle timer.
-  state.handleWindowBlur();
-  assert.equal(state.isControlsHidden.value, true);
-  assert.equal(timerFn, null, 'Pending hide timer must be cleared on blur');
-  assert.equal(bodyClasses.has('theater-immersive'), true);
-  assert.equal(bodyClasses.has('hide-cursor'), false, 'Cursor stays visible in non-fullscreen immersive mode');
-
-  // Returning focus keeps the immersive view; only a real interaction restores the chrome.
-  state.handleWindowFocus();
-  assert.equal(state.isControlsHidden.value, true, 'Focus should keep the immersive view');
-  state.handleWindowMouseMove();
-  assert.equal(state.isControlsHidden.value, false);
-  assert.equal(bodyClasses.has('theater-immersive'), false);
-
-  // Paused playback and non-theater views ignore blur.
-  state.onPause();
-  state.handleWindowBlur();
-  assert.equal(state.isControlsHidden.value, false);
-  state.isPlaying.value = true;
-  state.viewMode.value = 'catalog';
-  state.handleWindowBlur();
-  assert.equal(state.isControlsHidden.value, false);
-
-  // Focus listeners must be registered and unregistered with the component lifecycle.
-  const source = fs.readFileSync(require.resolve('../../src/client/js/app.js'), 'utf8');
-  assert.match(source, /window\.addEventListener\('blur', handleWindowBlur\)/);
-  assert.match(source, /window\.removeEventListener\('blur', handleWindowBlur\)/);
-  assert.match(source, /document\.addEventListener\?\.\('visibilitychange', handleVisibilityChange\)/);
-});
-
-test('mini mode keeps its own control layout and blur does not interrupt control interaction', () => {
-  const bodyClasses = new Set();
-  const state = client(async () => response([]), {
-    document: {
-      documentElement: { classList: { add() {} } },
-      body: { classList: { toggle: (cls, val) => val ? bodyClasses.add(cls) : bodyClasses.delete(cls) } }
-    }
-  });
-  state.viewMode.value = 'theater';
-  state.isMiniMode.value = true;
-  state.isPlaying.value = true;
-  state.handleControlsPointerEnter();
-  state.handleWindowBlur();
-  assert.equal(state.isControlsHidden.value, false);
-  state.setControlsHidden(true);
-  assert.equal(bodyClasses.has('theater-immersive'), false);
-});
-
-test('exiting fullscreen while playing arms the non-fullscreen theater hide timer', () => {
-  const listeners = {};
-  let timerMs;
-  const document = {
-    fullscreenElement: null,
-    documentElement: { classList: { add() {} } },
-    addEventListener(name, fn) { listeners[name] = fn; },
-    removeEventListener() {}
-  };
-  const state = client(async () => response([]), {
-    document,
-    setTimeout: (fn, ms) => { timerMs = ms; return 1; },
-    clearTimeout() { timerMs = undefined; }
-  });
-  state.mountForTest();
-  state.viewMode.value = 'theater';
-  state.isPlaying.value = true;
-  state.isFullscreen.value = true;
-  listeners.fullscreenchange();
-  assert.equal(state.isFullscreen.value, false);
-  assert.equal(timerMs, 2500);
 });
 
 test('theater sidebar toggle button toggles state and updates responsive button UI', () => {

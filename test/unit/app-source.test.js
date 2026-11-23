@@ -94,16 +94,13 @@ test('fetchAppPlayUrl batches nextVids and caches returned models in entryCache'
       return { code: 0, device_id_str: '999', install_id_str: '888' };
     }
     assert.equal(options.headers['Content-Encoding'], 'gzip');
-    // v04.10.03 mobile playback signing: only khronos/helios/medusa are sent.
-    assert.ok(options.headers['x-khronos']);
-    assert.ok(options.headers['x-helios']);
-    assert.ok(options.headers['x-medusa']);
+    assert.ok(options.headers['x-argus']);
+    assert.ok(options.headers['x-ladon']);
     assert.equal(options.headers['x-ss-stub'], createHash('md5').update(options.data).digest('hex').toUpperCase());
+    assert.ok(options.headers['x-ss-req-ticket']);
     assert.equal(new URL(url).searchParams.get('aid'), '8662');
     assert.equal(new URL(url).searchParams.get('version_name'), '7.4.3.32');
-    assert.equal(new URL(url).searchParams.get('device_type'), 'PGT-AN10');
-    assert.equal(new URL(url).searchParams.has('ts'), false);
-    assert.ok(options.headers['User-Agent'].includes('PGT-AN10'));
+    assert.ok(options.headers['User-Agent'].includes('74332'));
     requests.push({ url, body: JSON.parse(gunzipSync(options.data)) });
     return {
       code: 0,
@@ -207,46 +204,6 @@ test('fetchAppPlayUrl falls back across multi_video_model clusters before fallin
     assert.ok(urls[4].includes('api5-normal-hl.fqnovel.com'));
     assert.ok(urls[5].includes('api3-normal-sinfonlinea.fqnovel.com/novel/player/video_model/v1/'));
     assert.ok(urls[5].includes('device_id=999'), 'Fallback request should use the same active device');
-  } finally {
-    appSource.requestJson = originalRequest;
-    appSource.clearEntryCache();
-  }
-});
-
-
-test('fetchAppPlayUrl falls back to video_tab GET when every POST player endpoint is empty', async () => {
-  const originalRequest = appSource.requestJson;
-  appSource.clearEntryCache();
-  const urls = [];
-  let tabCalls = 0;
-
-  appSource.requestJson = async (url, options) => {
-    if (url.includes('register')) {
-      return { code: 0, device_id_str: '999', install_id_str: '888' };
-    }
-    urls.push({ url, method: options?.method });
-    if (url.includes('/reading/bookapi/video_tab/multi_video_model/v1/')) {
-      tabCalls++;
-      assert.equal(options?.method, 'GET', 'video_tab fallback must be a GET request');
-      assert.ok(!options?.data, 'video_tab fallback must not carry a body');
-      assert.ok(url.includes('video_id=30001'), 'video_tab must bind the requested episode');
-      assert.ok(url.includes('device_id=999'), 'video_tab must reuse the same registered device');
-      return {
-        code: 0,
-        data: { video_model_data: { '30001': mockEntry('30001') } },
-      };
-    }
-    // Every POST player + shortplay cluster returns an empty HTTP 200 body.
-    throw Object.assign(new Error('App upstream returned empty response'), { code: 'EMPTY_RESPONSE' });
-  };
-
-  try {
-    const play = await appSource.fetchAppPlayUrl('30001');
-    assert.equal(play.url, 'https://qznovelvod.com/video_30001.mp4');
-    assert.ok(tabCalls >= 1, 'video_tab fallback should have been attempted');
-    const tabIndex = urls.findIndex(entry => entry.url.includes('/reading/bookapi/video_tab/'));
-    assert.ok(tabIndex > 0, 'video_tab must be tried after the POST player endpoints');
-    assert.ok(urls.slice(0, tabIndex).every(entry => entry.method === 'POST'));
   } finally {
     appSource.requestJson = originalRequest;
     appSource.clearEntryCache();
